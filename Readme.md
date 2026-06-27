@@ -112,6 +112,9 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 | 117 | esp32-builder | stopped | debian | 2 | 2048 MB | 8G | no | vmbr1 | dhcp | /mnt/data/public/esp32-ups-monitor → /opt/esp32-ups-monitor |
 | 118 | tg-proxy | running | debian | 1 | 512 MB | 4G | yes | vmbr1 | 10.10.10.218/24 | — |
 
+
+### 📦 LXC Purposes
+
 | ID | Name | Purpose |
 |---|---|---|
 | 100 | anchor | Self-hosted note-taking |
@@ -130,6 +133,8 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 | 116 | syncthing | Syncthing continuous file sync |
 | 117 | esp32-builder | PlatformIO build + OTA push for ESP32 (stopped, onboot=0) |
 | 118 | tg-proxy | SOCKS5 proxy (GOST) via ProtonVPN WireGuard |
+
+---
 
 ### 🔄 NPM Proxy Hosts
 
