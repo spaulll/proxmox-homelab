@@ -1,8 +1,6 @@
 <p align="center">
     <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/proxmox/.github/main/Proxmox-logo-800-white.svg">
-        <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/proxmox/.github/main/Proxmox-logo-800.svg">
-        <img alt="Proxmox Logo" src="https://raw.githubusercontent.com/proxmox/.github/main/Proxmox-logo-800.svg">
+        <img alt="Proxmox Logo" src="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/proxmox.png" width="120">
     </picture>
 </p>
 
