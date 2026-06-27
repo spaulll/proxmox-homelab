@@ -91,7 +91,7 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 
 ---
 
-## LXC Containers
+## 📦 LXC Containers
 > 🗓️ Last Snapshot — Fri Jun 19 2026 | *Run snapshot script to refresh*
 
 | ID | Name | Status | OS | CPU | RAM | Disk | Boot | Bridge | IP | Mounts |
@@ -131,17 +131,21 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 | 117 | esp32-builder | PlatformIO build + OTA push for ESP32 (stopped, onboot=0) |
 | 118 | tg-proxy | SOCKS5 proxy (GOST) via ProtonVPN WireGuard |
 
-### NPM Proxy Hosts
+### 🔄 NPM Proxy Hosts
 
 | Domain | Backend | SSL |
 |---|---|---|
-| dns.myownserv.duckdns.org | http://192.168.0.146:80 | Let's Encrypt |
+| asus.lan | https://192.168.0.1:8443 | Custom |
+| asus.myownserv.duckdns.org | https://192.168.0.1:8443 | Let's Encrypt |
+| dns.myownserv.duckdns.org | http://192.168.0.169:8080 | Let's Encrypt |
 | files.myownserv.duckdns.org | http://10.10.10.144:8080 | Let's Encrypt |
+| homepage.myownserv.duckdns.org | http://10.10.10.109:3000 | Let's Encrypt |
 | immich.myownserv.duckdns.org | http://10.10.10.234:2283 | Let's Encrypt |
 | jellyfin.myownserv.duckdns.org | http://10.10.10.201:8096 | Let's Encrypt |
+| llm.myownserv.duckdns.org | http://10.10.10.243:3000 | Let's Encrypt |
+| notes.myownserv.duckdns.org | http://10.10.10.121:3000 | Let's Encrypt |
 | npm.myownserv.duckdns.org | http://10.10.10.200:81 | Let's Encrypt |
 | prox.myownserv.duckdns.org | https://192.168.0.50:8006 | Let's Encrypt |
-| asus.lan | https://192.168.0.1:8443 | Custom |
 
 ---
 
