@@ -93,50 +93,58 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 
 ---
 
-## 📦 LXC Containers
+## LXC Containers
 
-| ID | Name | IP | Bridge | Purpose |
-| --- | --- | --- | --- | --- |
-| **100** | anchor | DHCP | vmbr1 | Self-hosted note-taking |
-| **101** | npm | 10.10.10.200 | vmbr1 | Nginx Proxy Manager — reverse proxy + SSL |
-| **103** | aria2 | DHCP, rate 3MB/s | vmbr1 | Aria2 download manager + ariaflow auto-organizer |
-| **104** | jellyfin | 10.10.10.201, rate 2MB/s | vmbr1 | Jellyfin media server, HW transcoding via /dev/dri |
-| **105** | NAS | 192.168.0.10 | vmbr0 | Samba/SMB — exposes /mnt/data to LAN |
-| **106** | openwrt | eth0 .150 (WAN) / eth1 gw 10.10.10.1 (LAN) | vmbr0+1 | Router/gateway + DHCP for vmbr1 |
-| **107** | adguard | 192.168.0.146 | vmbr0 | AdGuard Home — primary DNS, Keepalived MASTER |
-| **109** | immich | DHCP | vmbr1 | Immich photo backup, HW transcoding via /dev/dri |
-| **110** | tailscale-LXC | 192.168.0.5 | vmbr0 | Tailscale subnet router (both subnets) |
-| **111** | filebrowser | DHCP | vmbr1 | Filebrowser web UI for /mnt/data |
-| **112** | opencode | DHCP | vmbr1 | OpenCode AI assistant (stopped, onboot=0) |
-| **113** | warp-exit | DHCP | vmbr1 | Cloudflare WARP egress + Tailscale exit node |
-| **115** | openwebui | DHCP | vmbr1 | Open WebUI for LLMs on 192.168.0.90 (stopped, onboot=0) |
-| **116** | syncthing | 192.168.0.57 | vmbr0 | Syncthing continuous file sync |
-| **117** | esp32-builder | DHCP | vmbr1 | PlatformIO build + OTA push for ESP32 (stopped, onboot=0) |
-| **118** | tg-proxy | 10.10.10.218 | vmbr1 | SOCKS5 proxy (GOST) via ProtonVPN WireGuard |
+> 🗓️ Last Snapshot — Fri Jun 19 2026
 
-### 🔗 Bind Mounts
+| ID | Name | Status | OS | CPU | RAM | Disk | Boot | Bridge | IP | Mounts |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 100 | anchor | running | debian | 1 | 2048 MB | 6G | yes | vmbr1 | dhcp | — |
+| 101 | npm | running | debian | 1 | 512 MB | 4G | yes | vmbr1 | dhcp | — |
+| 103 | aria2 | running | debian | 2 | 1024 MB | 8G | yes | vmbr1 | 10.10.10.177/24, rate=3MB/s | /mnt/data/public/Downloads → /mnt/nas |
+| 104 | jellyfin | running | ubuntu | 3 | 2048 MB | 16G | yes | vmbr1 | 10.10.10.201/24, rate=2MB/s | /mnt/data/public/Downloads/ → /mnt/smb |
+| 105 | NAS | running | alpine | 1 | 512 MB | 2G | yes | vmbr0 | 192.168.0.10/24 | /mnt/data/ → /srv/samba |
+| 106 | openwrt | running | unmanaged | 1 | 256 MB | 4G | yes | vmbr0+vmbr1 | — | — |
+| 107 | adguard | running | debian | 1 | 512 MB | 4G | yes | vmbr0 | 192.168.0.146/24 | — |
+| 109 | immich | running | debian | 4 | 6144 MB | 20G | yes | vmbr1 | dhcp | /mnt/data/public/immich/ → /mnt/nas |
+| 110 | tailscale-LXC | running | debian | 1 | 512 MB | 4G | yes | vmbr0 | 192.168.0.5/24 | — |
+| 111 | filebrowser | running | debian | 1 | 512 MB | 8G | yes | vmbr1 | dhcp | /mnt/data/ → /mnt/smb |
+| 113 | warp-exit | running | debian | 1 | 512 MB | 4G | yes | vmbr1 | dhcp | — |
+| 115 | openwebui | stopped | debian | 2 | 2048 MB | 21G | no | vmbr1 | dhcp | — |
+| 116 | syncthing | running | debian | 2 | 2048 MB | 8G | yes | vmbr0 | 192.168.0.57/24 | /mnt/data/public/syncthing → /root/syncthing |
+| 117 | esp32-builder | stopped | debian | 2 | 2048 MB | 8G | no | vmbr1 | dhcp | /mnt/data/public/esp32-ups-monitor → /opt/esp32-ups-monitor |
+| 118 | tg-proxy | running | debian | 1 | 512 MB | 4G | yes | vmbr1 | 10.10.10.218/24 | — |
 
-| LXC | Host Path | Container Path |
-| --- | --- | --- |
-| **103** | `/mnt/data/public/Downloads` | `/mnt/nas` |
-| **104** | `/mnt/data/public/Downloads` | `/mnt/smb` |
-| **105** | `/mnt/data/` | `/srv/samba` |
-| **109** | `/mnt/data/public/immich/` | `/mnt/nas` |
-| **111** | `/mnt/data/` | `/mnt/smb` |
-| **116** | `/mnt/data/public/syncthing` | `/root/syncthing` |
-| **117** | `/mnt/data/public/esp32-ups-monitor` | `/opt/esp32-ups-monitor` |
+| ID | Name | Purpose |
+|---|---|---|
+| 100 | anchor | Self-hosted note-taking |
+| 101 | npm | Nginx Proxy Manager — reverse proxy + SSL |
+| 103 | aria2 | Aria2 download manager + ariaflow auto-organizer |
+| 104 | jellyfin | Jellyfin media server, HW transcoding via /dev/dri |
+| 105 | NAS | Samba/SMB — exposes /mnt/data to LAN |
+| 106 | openwrt | Router/gateway + DHCP for vmbr1 |
+| 107 | adguard | AdGuard Home — primary DNS, Keepalived MASTER |
+| 109 | immich | Immich photo backup, HW transcoding via /dev/dri |
+| 110 | tailscale-LXC | Tailscale subnet router (both subnets) |
+| 111 | filebrowser | Filebrowser web UI for /mnt/data |
+| 112 | opencode | OpenCode AI assistant (stopped, onboot=0) |
+| 113 | warp-exit | Cloudflare WARP egress + Tailscale exit node |
+| 115 | openwebui | Open WebUI for LLMs (stopped, onboot=0) |
+| 116 | syncthing | Syncthing continuous file sync |
+| 117 | esp32-builder | PlatformIO build + OTA push for ESP32 (stopped, onboot=0) |
+| 118 | tg-proxy | SOCKS5 proxy (GOST) via ProtonVPN WireGuard |
 
-### 🔄 NPM Proxy Hosts
+### NPM Proxy Hosts
 
 | Domain | Backend | SSL |
-| --- | --- | --- |
-| dns.myownserv.duckdns.org | [http://192.168.0.146:80](http://192.168.0.146:80) | Let's Encrypt |
-| files.myownserv.duckdns.org | [http://10.10.10.144:8080](http://10.10.10.144:8080) | Let's Encrypt |
-| immich.myownserv.duckdns.org | [http://10.10.10.234:2283](http://10.10.10.234:2283) | Let's Encrypt |
-| jellyfin.myownserv.duckdns.org | [http://10.10.10.201:8096](http://10.10.10.201:8096) | Let's Encrypt |
-| npm.myownserv.duckdns.org | [http://10.10.10.200:81](http://10.10.10.200:81) | Let's Encrypt |
-| prox.myownserv.duckdns.org | [https://192.168.0.50:8006](https://192.168.0.50:8006) | Let's Encrypt |
-| asus.lan | [https://192.168.0.1:8443](https://192.168.0.1:8443) | Custom |
+|---|---|---|
+| dns.myownserv.duckdns.org | http://192.168.0.146:80 | Let's Encrypt |
+| files.myownserv.duckdns.org | http://10.10.10.144:8080 | Let's Encrypt |
+| immich.myownserv.duckdns.org | http://10.10.10.234:2283 | Let's Encrypt |
+| jellyfin.myownserv.duckdns.org | http://10.10.10.201:8096 | Let's Encrypt |
+| npm.myownserv.duckdns.org | http://10.10.10.200:81 | Let's Encrypt |
+| prox.myownserv.duckdns.org | https://192.168.0.50:8006 | Let's Encrypt |
+| asus.lan | https://192.168.0.1:8443 | Custom |
 
 ---
 
@@ -388,23 +396,3 @@ for ctid in $(pct list | awk 'NR>1 {print $1}' | sort -n); do
 done
 
 ```
-
-### 🗓️ Last Snapshot — Fri Jun 19 2026
-
-| ID | Name | Status | OS | CPU | RAM | Disk | Boot | Bridge | IP | Mounts |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **100** | anchor | running | debian | 1 | 2048 MB | 6G | yes | vmbr1 | dhcp | — |
-| **101** | npm | running | debian | 1 | 512 MB | 4G | yes | vmbr1 | dhcp | — |
-| **103** | aria2 | running | debian | 2 | 1024 MB | 8G | yes | vmbr1 | 10.10.10.177/24, rate=3MB/s | /mnt/data/public/Downloads → /mnt/nas |
-| **104** | jellyfin | running | ubuntu | 3 | 2048 MB | 16G | yes | vmbr1 | 10.10.10.201/24, rate=2MB/s | /mnt/data/public/Downloads/ → /mnt/smb |
-| **105** | NAS | running | alpine | 1 | 512 MB | 2G | yes | vmbr0 | 192.168.0.10/24 | /mnt/data/ → /srv/samba |
-| **106** | openwrt | running | unmanaged | 1 | 256 MB | 4G | yes | vmbr0+vmbr1 | — | — |
-| **107** | adguard | running | debian | 1 | 512 MB | 4G | yes | vmbr0 | 192.168.0.146/24 | — |
-| **109** | immich | running | debian | 4 | 6144 MB | 20G | yes | vmbr1 | dhcp | /mnt/data/public/immich/ → /mnt/nas |
-| **110** | tailscale-LXC | running | debian | 1 | 512 MB | 4G | yes | vmbr0 | 192.168.0.5/24 | — |
-| **111** | filebrowser | running | debian | 1 | 512 MB | 8G | yes | vmbr1 | dhcp | /mnt/data/ → /mnt/smb /mnt/data/public/.filebrowser-tmp → /usr/local/community-scripts/tmp |
-| **113** | warp-exit | running | debian | 1 | 512 MB | 4G | yes | vmbr1 | dhcp | — |
-| **115** | openwebui | stopped | debian | 2 | 2048 MB | 21G | no | vmbr1 | dhcp | — |
-| **116** | syncthing | running | debian | 2 | 2048 MB | 8G | yes | vmbr0 | 192.168.0.57/24 | /mnt/data/public/syncthing → /root/syncthing |
-| **117** | esp32-builder | stopped | debian | 2 | 2048 MB | 8G | no | vmbr1 | dhcp | /mnt/data/public/esp32-ups-monitor → /opt/esp32-ups-monitor |
-| **118** | tg-proxy | running | debian | 1 | 512 MB | 4G | yes | vmbr1 | 10.10.10.218/24 | — |
