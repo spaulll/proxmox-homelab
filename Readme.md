@@ -94,8 +94,7 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 ---
 
 ## LXC Containers
-
-> 🗓️ Last Snapshot — Fri Jun 19 2026
+> 🗓️ Last Snapshot — Fri Jun 19 2026 | *Run snapshot script to refresh*
 
 | ID | Name | Status | OS | CPU | RAM | Disk | Boot | Bridge | IP | Mounts |
 |---|---|---|---|---|---|---|---|---|---|---|
