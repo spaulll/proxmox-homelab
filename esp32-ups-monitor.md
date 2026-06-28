@@ -250,7 +250,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 ESP32_IP            = "192.168.0.178"
 ESP32_PORT          = 80
 ESP32_POLL_INTERVAL = 15        # seconds between state polls
-ESP32_TIMEOUT       = 5         # per-request timeout
+ESP32_TIMEOUT       = 12         # per-request timeout
 ESP32_DEAD_THRESH   = 3         # consecutive failures → alert
 
 PROXMOX_IP          = "192.168.0.50"
@@ -861,12 +861,13 @@ void notifyPi(String eventType) {
     http.GET();
     http.end();
 }
-
 bool tcpCheck(const char* host, int port, int timeoutMs = 2000) {
     WiFiClient client;
     client.setTimeout(timeoutMs);
     bool result = client.connect(host, port);
     client.stop();
+    server.handleClient(); 
+    ArduinoOTA.handle();   
     return result;
 }
 
