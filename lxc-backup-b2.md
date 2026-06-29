@@ -63,14 +63,14 @@ Backups are client-side encrypted via rclone crypt before upload.
 # Host: prox (192.168.0.50)
 # Schedule: Sunday 03:00 via cron
 # Staging: /mnt/data/public/backups/lxc/
-# B2 remote: b2lxccrypt (configure below)
+# B2 remote: b2lxccrypt
 # =============================================================================
 
 # --- Config ------------------------------------------------------------------
-TELEGRAM_TOKEN="YOUR_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID="YOUR_CHAT_ID_HERE"
+TELEGRAM_TOKEN="TELEGRAM_TOKEN"
+TELEGRAM_CHAT_ID="TELEGRAM_CHAT_ID"
 
-CTIDS=(107 101 106 105 103 110)
+CTIDS=(107 101 106 105 103 110 109)
 CT_NAMES=(
     [107]="adguard"
     [101]="npm"
@@ -78,10 +78,11 @@ CT_NAMES=(
     [105]="NAS"
     [103]="aria2"
     [110]="tailscale"
+    [109]="immich"
 )
 
 STAGING_DIR="/mnt/data/public/backups/lxc"
-RCLONE_REMOTE="b2lxccrypt"    # rclone crypt remote name (configure during setup)
+RCLONE_REMOTE="b2lxccrypt"
 B2_BUCKET_PATH="${RCLONE_REMOTE}:prox-lxc-backups"
 VZDUMP_OPTS="--compress zstd --mode snapshot --quiet 1"
 LOG="/var/log/lxc-backup-b2.log"
@@ -129,10 +130,13 @@ for CTID in "${CTIDS[@]}"; do
     NAME="${CT_NAMES[$CTID]}"
     log "--- Backing up CT ${CTID} (${NAME}) ---"
 
+    # 1. Remove all previous local dumps for this CT (both old and new naming)
     rm -f "${STAGING_DIR}"/vzdump-lxc-${CTID}-*.tar.zst \
-          "${STAGING_DIR}"/vzdump-lxc-${CTID}-*.tar.zst.log
-    log "CT${CTID}: Cleared old local dump"
+          "${STAGING_DIR}"/vzdump-lxc-${CTID}-*.tar.zst.log \
+          "${STAGING_DIR}"/${NAME}-${CTID}-*.tar.zst
+    log "CT${CTID}: Cleared old local dumps"
 
+    # 2. Run vzdump
     if vzdump "$CTID" --dumpdir "$STAGING_DIR" $VZDUMP_OPTS >> "$LOG" 2>&1; then
         DUMP_FILE=$(ls -t "${STAGING_DIR}"/vzdump-lxc-${CTID}-*.tar.zst 2>/dev/null | head -1)
 
@@ -143,13 +147,24 @@ for CTID in "${CTIDS[@]}"; do
             continue
         fi
 
+        # 3. Rename to human-readable format
+        TIMESTAMP=$(date '+%Y-%m-%d_%Hh%M')
+        RENAMED="${STAGING_DIR}/${NAME}-${CTID}-${TIMESTAMP}.tar.zst"
+        mv "$DUMP_FILE" "$RENAMED"
+        DUMP_FILE="$RENAMED"
+
         DUMP_BYTES=$(stat -c%s "$DUMP_FILE" 2>/dev/null || echo 0)
         CT_SIZE[$CTID]=$(human_size "$DUMP_BYTES")
         log "CT${CTID}: dump OK → $(basename "$DUMP_FILE") (${CT_SIZE[$CTID]})"
 
+        # 4. Clear ALL old B2 files for this CT (handles both naming conventions)
         DEST="${B2_BUCKET_PATH}/${NAME}/"
+        log "CT${CTID}: clearing old B2 files at ${DEST} ..."
+        rclone delete "$DEST" >> "$LOG" 2>&1
+
+        # 5. Upload renamed file
         log "CT${CTID}: uploading to ${DEST} ..."
-        if rclone sync "$DUMP_FILE" "$DEST" --progress 2>> "$LOG"; then
+        if rclone copy "$DUMP_FILE" "$DEST" --progress 2>> "$LOG"; then
             CT_STATUS[$CTID]="✅ OK"
             log "CT${CTID}: upload complete"
         else
@@ -204,6 +219,9 @@ ${PER_CT_LINES}
 📦 B2 before: $(human_size "$B2_SIZE_BEFORE")
 📦 B2 after:  $(human_size "$B2_SIZE_AFTER")
 ⏱ Duration:  ${DURATION_FMT}"
+
+log "Cleaning up old B2 versions..."
+rclone cleanup "$B2_BUCKET_PATH" >> "$LOG" 2>&1
 
 tg_send "$MSG"
 log "Telegram summary sent"
