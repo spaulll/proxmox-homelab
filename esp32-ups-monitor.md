@@ -871,7 +871,22 @@ bool tcpCheck(const char* host, int port, int timeoutMs = 2000) {
     return result;
 }
 
-bool isMainsUp() { return tcpCheck(PING_TARGET, PING_PORT); }
+bool isMainsUp() {
+    const int MAINS_RETRY_COUNT     = 3;
+    const int MAINS_RETRY_DELAY_MS  = 500;
+
+    for (int attempt = 0; attempt < MAINS_RETRY_COUNT; attempt++) {
+        if (tcpCheck(PING_TARGET, PING_PORT)) {
+            return true;  // any single success = mains up, no need to keep retrying
+        }
+        if (attempt < MAINS_RETRY_COUNT - 1) {
+            delay(MAINS_RETRY_DELAY_MS);
+            ArduinoOTA.handle();
+            server.handleClient();
+        }
+    }
+    return false;  // all attempts failed — only now treat as a real failure
+}
 
 bool isWANUp() {
     if (tcpCheck(WAN_TARGET_1, WAN_PORT, 2000)) return true;
