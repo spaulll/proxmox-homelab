@@ -370,6 +370,16 @@ def fmt_uptime(secs):
     parts.append(f"{mins}m")
     return " ".join(parts)
 
+def fmt_downtime(secs):
+    secs = int(max(0, secs))
+    if secs < 60:
+        return f"{secs}s"
+    mins, s = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}m {s}s"
+    h, m = divmod(mins, 60)
+    return f"{h}h {m}m"
+
 def get_proxmox_uptime():
     if not _tcp_reachable(PROXMOX_IP, PROXMOX_PORT, timeout=3):
         return False, "Offline"
@@ -489,7 +499,7 @@ def process_esp_notification(event):
             if event == "mains_false_alarm" and _mains_down_started_at is not None:
                 elapsed = time.time() - _mains_down_started_at
                 adjusted = max(0, elapsed - EXTENDER_BOOT_LAG_SEC)
-                approx_downtime_str = fmt_uptime(adjusted)
+                approx_downtime_str = fmt_downtime(adjusted)
                 _mains_down_started_at = None
         elif event == "shutdown_mains_start":
             _esp32_state["mainsUp"] = False
