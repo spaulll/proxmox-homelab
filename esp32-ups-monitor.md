@@ -269,10 +269,12 @@ TG_RETRY_DELAY      = 5         # wait after Telegram error
 
 # Plug-and-play SOCKS5 proxy
 TG_PROXY            = None  
-# TG_PROXY = "socks5h://PROXY_USERNAME:PROXY_PASSWORD@10.10.10.218:8388"
+# TG_PROXY = "socks5h://username:password@10.10.10.218:8388"
 # Timeouts for mains/WAN failures
 MAINS_FAILURE_TIMEOUT_MS = 300_000    # 5 min
 WAN_FAILURE_TIMEOUT_MS   = 600_000    # 10 min
+EXTENDER_BOOT_LAG_SEC    = 40         # 40 seconds approx time extender takes to respond after mains restores
+
 
 LOG_FILE = "/var/log/ups-monitor.log"
 # ==================================================
@@ -293,6 +295,7 @@ _esp32_state   = {}
 _esp32_fail    = 0        
 _esp32_alerted = False    
 _tg_last_id    = -1
+_mains_down_started_at = None 
 
 # ==================================================
 # NETWORK OPERATIONS HELPERS
@@ -470,16 +473,24 @@ class ESPNotifyHandler(BaseHTTPRequestHandler):
 
 def process_esp_notification(event):
     log.info(f"Asynchronous webhook hit from ESP32: event={event}")
-    global _esp32_state
+    global _esp32_state, _mains_down_started_at
+
+    approx_downtime_str = None  # populated only on a real restore-from-down event
 
     # --- Real-Time State Overrides to Prevent Cache Stodginess ---
     with _lock:
         if event == "mains_down_countdown_start":
             _esp32_state["mainsUp"] = False
-            _esp32_state["mainsFailSinceMs"] = 1 # Force metrics to reflect a running countdown
+            _esp32_state["mainsFailSinceMs"] = 1  # Force metrics to reflect a running countdown
+            _mains_down_started_at = time.time()
         elif event == "mains_false_alarm" or event == "mains_restored_override_cleared":
             _esp32_state["mainsUp"] = True
             _esp32_state["mainsFailSinceMs"] = 0
+            if event == "mains_false_alarm" and _mains_down_started_at is not None:
+                elapsed = time.time() - _mains_down_started_at
+                adjusted = max(0, elapsed - EXTENDER_BOOT_LAG_SEC)
+                approx_downtime_str = fmt_uptime(adjusted)
+                _mains_down_started_at = None
         elif event == "shutdown_mains_start":
             _esp32_state["mainsUp"] = False
             _esp32_state["sdMains"] = True
@@ -497,7 +508,8 @@ def process_esp_notification(event):
         "mains_down_override_active":
             "⚠️ <b>Mains Down</b>\n\nManual override is active — auto-shutdown suppressed. Send /off to shut down manually.",
         "mains_false_alarm":
-            "✅ <b>Mains Restored</b>\n\nLine recovered before the 5 min timeout. No action taken.",
+            "✅ <b>Mains Restored</b>\n\nLine recovered before the 5 min timeout. No action taken."
+            + (f"\n⏱️ Approx downtime: ~{approx_downtime_str}" if approx_downtime_str else ""),
         "mains_restored_override_cleared":
             "✅ <b>Mains Restored</b>\n\nManual override cleared. Monitoring resumed normally.",
         "shutdown_mains_start":
@@ -517,7 +529,8 @@ def process_esp_notification(event):
         "wan_restored_mains_down_hold":
             "🌐 <b>WAN Restored</b>\n\nInternet is back, but mains is still down. Holding restore until power returns.",
     }
-    if event in mapping: send_telegram(mapping[event])
+    if event in mapping:
+        send_telegram(mapping[event])
 
 def start_webhook_server():
     log.info("Launching incoming notification intercept engine on port 9997...")
