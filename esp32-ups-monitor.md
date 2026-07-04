@@ -295,6 +295,7 @@ _esp32_state   = {}
 _esp32_fail    = 0        
 _esp32_alerted = False    
 _tg_last_id    = -1
+_tg_session = requests.Session()
 _mains_down_started_at = None 
 
 # ==================================================
@@ -326,24 +327,34 @@ def _tcp_reachable(host, port, timeout=3):
 # TELEGRAM SERVICE CLIENT
 # ==================================================
 
+#def _tg_request(method, params=None):
+#    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
+#    if TG_PROXY:
+#        try:
+#            import requests as req_lib
+#            proxies = {"https": TG_PROXY, "http": TG_PROXY}
+#            r = req_lib.get(url, params=params or {}, proxies=proxies, timeout=TG_POLL_TIMEOUT + 3)
+#            return r.json()
+#        except Exception as e:
+#            log.warning(f"Telegram via proxy failed: {e}")
+#            return None
+#    if params:
+#        url += "?" + urllib.parse.urlencode(params)
+#    try:
+#        _, body = _http_get_raw(url, timeout=TG_POLL_TIMEOUT + 3)
+#        return json.loads(body)
+#    except Exception as e:
+#        log.warning(f"Telegram direct operation failed: {e}")
+#        return None
+
 def _tg_request(method, params=None):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
-    if TG_PROXY:
-        try:
-            import requests as req_lib
-            proxies = {"https": TG_PROXY, "http": TG_PROXY}
-            r = req_lib.get(url, params=params or {}, proxies=proxies, timeout=TG_POLL_TIMEOUT + 3)
-            return r.json()
-        except Exception as e:
-            log.warning(f"Telegram via proxy failed: {e}")
-            return None
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
+    proxies = {"https": TG_PROXY, "http": TG_PROXY} if TG_PROXY else None
     try:
-        _, body = _http_get_raw(url, timeout=TG_POLL_TIMEOUT + 3)
-        return json.loads(body)
+        r = _tg_session.get(url, params=params or {}, proxies=proxies, timeout=TG_POLL_TIMEOUT + 3)
+        return r.json()
     except Exception as e:
-        log.warning(f"Telegram direct operation failed: {e}")
+        log.warning(f"Telegram request failed: {e}")
         return None
 
 def send_telegram(text):
@@ -434,6 +445,7 @@ def _is_esp32_reachable():
 def esp32_poll_loop():
     global _esp32_fail, _esp32_alerted, _esp32_state
     log.info("Starting background worker polling loop...")
+    BACKOFF_CAP = 60  # never wait longer than this between polls
     while True:
         state = _poll_esp32()
         alert_dead, alert_recovery, recovery_fw = False, False, "?"
@@ -455,8 +467,14 @@ def esp32_poll_loop():
             send_telegram(f"✅ <b>ESP32 BACK ONLINE</b>\n\nUPS sensor ({ESP32_IP}) recovered.\nFirmware: {recovery_fw}")
         elif alert_dead:
             send_telegram(f"⚠️ <b>ESP32 UNREACHABLE</b>\n\nSensor missed metrics. Authority systems remain autonomous.")
-            
-        time.sleep(ESP32_POLL_INTERVAL)
+
+        with _lock:
+            fail_count = _esp32_fail
+        if fail_count >= ESP32_DEAD_THRESH:
+            sleep_time = min(ESP32_POLL_INTERVAL * (2 ** (fail_count - ESP32_DEAD_THRESH + 1)), BACKOFF_CAP)
+        else:
+            sleep_time = ESP32_POLL_INTERVAL
+        time.sleep(sleep_time)
 
 # ==================================================
 # REALTIME ESP32 NOTIFICATION WEBHOOK SERVER
@@ -496,7 +514,7 @@ def process_esp_notification(event):
         elif event == "mains_false_alarm" or event == "mains_restored_override_cleared":
             _esp32_state["mainsUp"] = True
             _esp32_state["mainsFailSinceMs"] = 0
-            if event == "mains_false_alarm" and _mains_down_started_at is not None:
+            if _mains_down_started_at is not None:
                 elapsed = time.time() - _mains_down_started_at
                 adjusted = max(0, elapsed - EXTENDER_BOOT_LAG_SEC)
                 approx_downtime_str = fmt_downtime(adjusted)
@@ -504,6 +522,7 @@ def process_esp_notification(event):
         elif event == "shutdown_mains_start":
             _esp32_state["mainsUp"] = False
             _esp32_state["sdMains"] = True
+            _mains_down_started_at = None   
         elif event == "shutdown_wan_start":
             _esp32_state["wanUp"] = False
             _esp32_state["sdWAN"] = True
@@ -521,7 +540,8 @@ def process_esp_notification(event):
             "✅ <b>Mains Restored</b>\n\nLine recovered before the 5 min timeout. No action taken."
             + (f"\n⏱️ Approx downtime: ~{approx_downtime_str}" if approx_downtime_str else ""),
         "mains_restored_override_cleared":
-            "✅ <b>Mains Restored</b>\n\nManual override cleared. Monitoring resumed normally.",
+            "✅ <b>Mains Restored</b>\n\nManual override cleared. Monitoring resumed normally."
+            + (f"\n⏱️ Approx downtime: ~{approx_downtime_str}" if approx_downtime_str else ""),
         "shutdown_mains_start":
             "🔴 <b>Shutting Down — Mains Timeout</b>\n\nMains was down for 5 minutes. Sending shutdown to Proxmox now.",
         "shutdown_wan_start":
