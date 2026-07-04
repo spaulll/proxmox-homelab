@@ -749,8 +749,7 @@ def handle_command(text):
                 "Proxmox is already down. No action taken."
             )
             return
-        if _send_esp32_command({"cmd": "shutdown"}):
-            start_verification(expect_up=False, trigger_label="/off (manual)", timeout_sec=120, interval_sec=8)
+        _send_esp32_command({"cmd": "shutdown"})
 
 def telegram_poll_loop():
     global _tg_last_id
