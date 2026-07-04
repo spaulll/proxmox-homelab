@@ -328,26 +328,6 @@ def _tcp_reachable(host, port, timeout=3):
 # TELEGRAM SERVICE CLIENT
 # ==================================================
 
-#def _tg_request(method, params=None):
-#    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
-#    if TG_PROXY:
-#        try:
-#            import requests as req_lib
-#            proxies = {"https": TG_PROXY, "http": TG_PROXY}
-#            r = req_lib.get(url, params=params or {}, proxies=proxies, timeout=TG_POLL_TIMEOUT + 3)
-#            return r.json()
-#        except Exception as e:
-#            log.warning(f"Telegram via proxy failed: {e}")
-#            return None
-#    if params:
-#        url += "?" + urllib.parse.urlencode(params)
-#    try:
-#        _, body = _http_get_raw(url, timeout=TG_POLL_TIMEOUT + 3)
-#        return json.loads(body)
-#    except Exception as e:
-#        log.warning(f"Telegram direct operation failed: {e}")
-#        return None
-
 def _tg_request(method, params=None):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
     proxies = {"https": TG_PROXY, "http": TG_PROXY} if TG_PROXY else None
@@ -439,6 +419,43 @@ def _get_esp32_state():
 def _is_esp32_reachable():
     with _lock: return _esp32_fail < ESP32_DEAD_THRESH
 
+def _verify_proxmox_transition(expect_up, trigger_label, timeout_sec=120, interval_sec=10):
+    """
+    Polls Proxmox until it reaches the expected state (up or down),
+    then sends a Telegram confirmation. Runs in its own thread — never
+    blocks the caller.
+    """
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        prox_up, prox_uptime = get_proxmox_uptime()
+        if prox_up == expect_up:
+            if expect_up:
+                send_telegram(
+                    f"✅ <b>Proxmox Confirmed Online</b>\n\n"
+                    f"Trigger: {trigger_label}\n⌚ Uptime: {prox_uptime}"
+                )
+            else:
+                send_telegram(
+                    f"✅ <b>Proxmox Confirmed Offline</b>\n\n"
+                    f"Trigger: {trigger_label}"
+                )
+            return
+        time.sleep(interval_sec)
+
+    # Timed out without reaching expected state
+    state_word = "online" if expect_up else "offline"
+    send_telegram(
+        f"⚠️ <b>Verification Timeout</b>\n\n"
+        f"Trigger: {trigger_label}\n"
+        f"Proxmox did not confirm {state_word} within {timeout_sec}s. Check manually."
+    )
+
+def start_verification(expect_up, trigger_label, timeout_sec=120, interval_sec=10):
+    threading.Thread(
+        target=_verify_proxmox_transition,
+        args=(expect_up, trigger_label, timeout_sec, interval_sec),
+        daemon=True,
+    ).start()
 # ==================================================
 # ESP32 POLLING DAEMON
 # ==================================================
@@ -561,7 +578,14 @@ def process_esp_notification(event):
             "🌐 <b>WAN Restored</b>\n\nInternet is back, but mains is still down. Holding restore until power returns.",
     }
     if event in mapping:
-        send_telegram(mapping[event])
+            send_telegram(mapping[event])
+
+    # --- Outcome verification for shutdown/wake triggers ---
+    if event in ("shutdown_mains_start", "shutdown_wan_start",
+                "shutdown_manual_mains_down", "shutdown_manual_normal"):
+        start_verification(expect_up=False, trigger_label=event, timeout_sec=120, interval_sec=8)
+    elif event == "wol_packet_sent":
+        start_verification(expect_up=True, trigger_label=event, timeout_sec=120, interval_sec=10)
 
 def start_webhook_server():
     log.info("Launching incoming notification intercept engine on port 9997...")
@@ -725,7 +749,8 @@ def handle_command(text):
                 "Proxmox is already down. No action taken."
             )
             return
-        _send_esp32_command({"cmd": "shutdown"})
+        if _send_esp32_command({"cmd": "shutdown"}):
+            start_verification(expect_up=False, trigger_label="/off (manual)", timeout_sec=120, interval_sec=8)
 
 def telegram_poll_loop():
     global _tg_last_id
@@ -762,7 +787,6 @@ if __name__ == "__main__":
     
     # 3. Enter permanent polling loops for management plane commands
     telegram_poll_loop()
-
 ```
 
 * **Path:** `/etc/systemd/system/ups-monitor.service`
