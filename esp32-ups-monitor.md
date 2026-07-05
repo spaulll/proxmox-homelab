@@ -1,43 +1,7 @@
-# ESP32 UPS Power Monitor & Automation System (V5 Decoupled)
+# ESP32 UPS Power Monitor & Automation System
 
 ---
  
-## Changelog — V4.2 → V5.2
- 
-### Architecture
- 
-| Type | Change |
-|---|---|
-| NEW | **Decoupled control plane — Pi becomes the brain.** V4 ran Telegram long-polling, command handling, and state logic entirely on the ESP32. V5 offloads all of that to a new `ups-monitor.py` service on the Pi (192.168.0.169), leaving the ESP32 as a pure sensor and actuator. |
-| NEW | **ESP32 JSON state API — `/state` and `/command`.** ESP32 now exposes `GET /state` (full telemetry JSON) and `POST /command` (accepts `wake` / `shutdown`). Pi polls `/state` every 15 seconds and writes commands via `/command`. |
-| NEW | **Pi notification webhook server — port 9997.** ESP32 fires `GET /notify?event=...` to the Pi immediately on state transitions (mains drop, WAN loss, shutdown, WOL, boot). Replaces the previous polling-only model — events are now instant instead of waiting up to 15 seconds. |
-| NEW | **Deferred command execution pattern.** Commands received via `POST /command` are stored in a `pendingCommand` flag and executed from the main loop, not from inside the HTTP handler. Prevents stack re-entrancy crashes when `executeShutdownProxmox()` or `executeWakeProxmox()` are triggered remotely. |
- 
-### Firmware (ESP32)
- 
-| Type | Change |
-|---|---|
-| NEW | **BSSID lock to main router.** Wi-Fi now binds explicitly to the Asus main router BSSID (`CC:28:AA:C0:A2:70`) at connect time. Prevents the ESP32 from roaming to the DIR-825 extender, which would cause false mains-down readings. |
-| FIX | **BSSID preserved on Wi-Fi reconnect (V5.1).** Reconnect path in `loop()` now passes `MAIN_ROUTER_BSSID` to `WiFi.begin()`. Previously the disconnect/reconnect path dropped the BSSID, allowing extender association after a drop. |
-| FIX | **Cached mains/WAN state in `/state` handler (V5.1).** `handleGetState()` now reads `cachedMainsUp` / `cachedWanUp` instead of calling `isMainsUp()` and `isWANUp()` live. Eliminates up to 4 seconds of blocking TCP inside the web server thread during a `/status` request. |
-| CHANGE | **Notifications now fire to Pi, not Telegram directly.** V4 sent Telegram messages straight from the ESP32. V5 ESP32 calls `notifyPi(event)` — a lightweight local HTTP call to `192.168.0.169:9997` — and the Pi handles all Telegram formatting and delivery. |
-| REMOVED | **Telegram long-polling removed from firmware.** ESP32 no longer polls `getUpdates` or handles `/on`, `/off`, `/status` commands. All Telegram interaction is now handled by the Pi brain service. |
-| REMOVED | **ElegantOTA dependency dropped.** Replaced by the native `ArduinoOTA` library (part of the ESP32 Arduino core). `platformio.ini` now only declares `ArduinoJson` as an external dependency. |
- 
-### Pi Brain Service (new in V5)
- 
-| Type | Change |
-|---|---|
-| NEW | **`ups-monitor.py` — main control service.** Runs on Pi as `ups-monitor.service`. Manages Telegram long-polling, command dispatch (`/on`, `/off`, `/status`), ESP32 background polling, liveness alerting, and real-time state assembly. |
-| NEW | **Independent Proxmox and extender uptime in `/status`.** Pi queries the Proxmox API (`192.168.0.50:8006`) and the extender uptime bridge (`127.0.0.1:9998`) directly. `/status` remains useful even if the ESP32 is unreachable. |
-| NEW | **ESP32 liveness alerting.** After 3 consecutive failed polls (~45 seconds), Pi sends a Telegram alert that the hardware sensor is offline. Sends a recovery message when polling resumes. ESP32 autonomous shutdown logic continues regardless. |
-| NEW | **Real-time state overrides on webhook events.** When the Pi receives an event like `mains_down_countdown_start`, it immediately patches its cached ESP32 state so a `/status` response during the polling gap reflects the actual situation. |
-| NEW | **Countdown timers in `/status`.** While mains or WAN is down, `/status` shows a live countdown to shutdown (e.g. `⏳ Shutting down in 4m 47s...`) calculated from `mainsFailSinceMs` / `wanFailSinceMs` in the ESP32 state JSON. |
-| NEW | **Compact `/status` card (V5.2 UI).** Status redesigned — mains/WAN/Proxmox only, extender uptime inline, countdown dominant. ESP32 diagnostics moved to new `/diag` command. |
-| NEW | **Optional SOCKS5 proxy for Telegram (`TG_PROXY`).** Pi brain supports a configurable SOCKS5 proxy for Telegram API calls. Set `TG_PROXY = "socks5h://..."` to enable; `None` uses direct connection. |
-
----
-
 This document outlines the complete setup for the decentralized V5 ESP32-based UPS monitor. The system relies on four decoupled components to maximize Snappiness and Failsafe Autonomy:
 
 1. **The Shutdown Webhook** (Running on the Proxmox host to execute local node cut commands).
@@ -45,6 +9,32 @@ This document outlines the complete setup for the decentralized V5 ESP32-based U
 3. **The ESP32 Firmware** (The autonomous, lightweight hardware sensor and absolute fallback executioner).
 4. **The Raspberry Pi Main Brain Service** (The control plane managing Telegram long-polling, SOCKS5 proxies, formatting, and live state compilation).
 5. **The ESP32 Builder LXC** (CI/CD automated compilation and OTA delivery container).
+
+---
+
+## ESP32 Firmware — What it does
+
+- Checks mains (TCP → `192.168.0.2:80`, extender) and WAN (`8.8.8.8`/`1.1.1.1:53`) every 30s
+- **V6.0:** checks now run on core 0 (`netCheckTask`, FreeRTOS task), writing to `cachedMainsUp`/`cachedWanUp` under `cacheMux`; `loop()` (core 1) reads the cache instead of blocking — keeps `/state` responsive during outages
+- Exposes `GET /state` (telemetry JSON) and `POST /command` (`wake`/`shutdown`, deferred via `pendingCommand` to avoid re-entrancy crashes)
+- Fires instant event webhooks to Pi (`:9997/notify?event=...`) on every state transition
+- Auto-shuts down Proxmox (`:9999/shutdown`) after 5 min mains-down or 10 min WAN-down
+- Auto-wakes via WOL when mains+WAN both recover
+- Tracks 3 shutdown-reason flags (`sdMains`, `sdWAN`, `sdManual` + `manualOffWhileMainsDown`) persisted in NVS, governing auto-restore eligibility
+- `manualOverride` flag suppresses mains auto-shutdown when `/on` sent while mains is down
+- Flap detection: 3+ mains recoveries in 10 min → one-time alert
+- BSSID-locked Wi-Fi (`CC:28:AA:C0:A2:70`) on connect + reconnect, prevents roaming to the extender
+- OTA via `ArduinoOTA`
+
+## Pi Brain (`ups-monitor.py`) — What it does
+
+- Polls ESP32 `/state` every 15s (background thread); after 3 fails (~45s) sends "unreachable" alert with exponential backoff (cap 60s), sends recovery alert when polling resumes
+- Runs webhook server on `:9997` to catch instant ESP32 events, patches cached state in real time (e.g. `mains_down_countdown_start`)
+- Formats and sends all Telegram messages (ESP32 no longer talks to Telegram directly)
+- Handles Telegram long-polling + commands: `/status` (mains/WAN/Proxmox + live countdown), `/diag` (RSSI, heap, firmware, flaps, overrides), `/on`, `/off` (both gated on ESP32 reachability + current Proxmox state)
+- Queries Proxmox API (`:8006`) and extender-uptime bridge (`:9998`) directly and independently of ESP32
+- Verifies shutdown/wake outcomes by polling Proxmox for up to 120s post-trigger, sends confirmation or timeout warning
+- Optional SOCKS5 proxy for Telegram traffic (`TG_PROXY`, currently `None`)
 
 ---
 
@@ -835,7 +825,7 @@ const char* WIFI_PASS    = "WIFI_PASSWORD";
 const uint8_t MAIN_ROUTER_BSSID[] = {0xCC, 0x28, 0xAA, 0xC0, 0xA2, 0x70}; 
 
 const char* OTA_PASSWORD = "OTA_PASSWORD";
-const char* FW_VERSION   = "V5.2";
+const char* FW_VERSION   = "V6.0";
 
 const char* PING_TARGET  = "192.168.0.2"; // Extender IP for checking mains status
 const int   PING_PORT    = 80;
@@ -850,7 +840,7 @@ const char* M900_MAC     = "00:23:24:c7:1f:5d";
 // Target Pi notification endpoint
 const char* PI_NOTIFY_URL = "http://192.168.0.169:9997/notify";
 
-const unsigned long PING_INTERVAL_MS         = 30000;
+const unsigned long PING_INTERVAL_MS         = 15000;
 const unsigned long MAINS_FAILURE_TIMEOUT_MS = 300000;   // 5 min
 const unsigned long WAN_FAILURE_TIMEOUT_MS   = 600000;   // 10 min
 
@@ -889,6 +879,10 @@ String pendingCommand = "";
 
 WiFiUDP udp;
 WebServer server(80);
+
+// --- Background network-check task (runs on core 0, parallel to loop()/server on core 1) ---
+TaskHandle_t netCheckTaskHandle = NULL;
+portMUX_TYPE cacheMux = portMUX_INITIALIZER_UNLOCKED; // guards cachedMainsUp/cachedWanUp
 
 // ==================================================
 // PERSIST
@@ -963,6 +957,28 @@ bool isWANUp() {
 
 bool isM900ShutDown() {
     return shutdownReasonMains || shutdownReasonWAN || shutdownReasonManual;
+}
+
+// ==================================================
+// BACKGROUND NETWORK-CHECK TASK (core 0)
+// ==================================================
+// Runs isMainsUp()/isWANUp() on their own core so the /state HTTP handler
+// (served from loop() on core 1) is never queued behind a blocking TCP
+// check. Writes results into cachedMainsUp/cachedWanUp under a spinlock.
+// Does not alter any timing, retry, or decision logic — isMainsUp() and
+// isWANUp() themselves are untouched.
+void netCheckTask(void *pvParameters) {
+    for (;;) {
+        bool mainsUp = isMainsUp();
+        bool wanUp   = isWANUp();
+
+        portENTER_CRITICAL(&cacheMux);
+        cachedMainsUp = mainsUp;
+        cachedWanUp   = wanUp;
+        portEXIT_CRITICAL(&cacheMux);
+
+        vTaskDelay(pdMS_TO_TICKS(PING_INTERVAL_MS));
+    }
 }
 
 void sendNativeWOL(const char* macStr) {
@@ -1169,6 +1185,18 @@ void setup() {
     server.on("/command", HTTP_POST, handlePostCommand); 
     server.begin();
 
+    // Launch mains/WAN checks on core 0, parallel to loop()/server on core 1,
+    // so /state is never queued behind a blocking TCP check.
+    xTaskCreatePinnedToCore(
+        netCheckTask,
+        "netCheckTask",
+        4096,
+        NULL,
+        1,
+        &netCheckTaskHandle,
+        0
+    );
+
     espBootTime = millis(); 
     delay(1000); 
     notifyPi("esp_booted");
@@ -1213,10 +1241,12 @@ void loop() {
     if (now - lastPingTime < PING_INTERVAL_MS) return;
     lastPingTime = now;
 
-    bool mainsUp = isMainsUp();
-    bool wanUp   = isWANUp();
-    cachedMainsUp = mainsUp;   // ← add this
-    cachedWanUp   = wanUp;     // ← add this
+    // Checks now run on core 0 (netCheckTask); read the latest result here
+    // instead of blocking loop()/server with a direct call.
+    portENTER_CRITICAL(&cacheMux);
+    bool mainsUp = cachedMainsUp;
+    bool wanUp   = cachedWanUp;
+    portEXIT_CRITICAL(&cacheMux);
 
     if (mainsUp) checkFlapReset();
 
