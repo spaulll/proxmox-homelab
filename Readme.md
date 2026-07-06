@@ -205,6 +205,8 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 
 Monitors mains power (TCP → 192.168.0.2:80) and WAN (TCP → 8.8.8.8:53 / 1.1.1.1:53). Triggers graceful Proxmox shutdown on failure, restores via WOL. Telegram control via Pi ups-monitor.py.
 
+> Note: 192.168.0.2 → a wifi extender directly connected to mains. Offline → mains down, Online → mains up.
+
 **Source:** `/mnt/data/public/esp32-ups-monitor/src/main.cpp`
 
 ### ⚙️ Firmware Config
