@@ -922,13 +922,12 @@ void notifyPi(String eventType) {
     http.GET();
     http.end();
 }
+
 bool tcpCheck(const char* host, int port, int timeoutMs = 2000) {
     WiFiClient client;
     client.setTimeout(timeoutMs);
     bool result = client.connect(host, port);
     client.stop();
-    server.handleClient(); 
-    ArduinoOTA.handle();   
     return result;
 }
 
@@ -942,8 +941,6 @@ bool isMainsUp() {
         }
         if (attempt < MAINS_RETRY_COUNT - 1) {
             delay(MAINS_RETRY_DELAY_MS);
-            ArduinoOTA.handle();
-            server.handleClient();
         }
     }
     return false;  // all attempts failed — only now treat as a real failure
