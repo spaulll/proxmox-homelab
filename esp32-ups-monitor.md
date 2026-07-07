@@ -415,14 +415,23 @@ def _verify_proxmox_transition(expect_up, trigger_label, timeout_sec=120, interv
     then sends a Telegram confirmation. Runs in its own thread — never
     blocks the caller.
     """
+    global _mains_down_started_at
     start = time.time()
     while time.time() - start < timeout_sec:
         prox_up, prox_uptime = get_proxmox_uptime()
         if prox_up == expect_up:
             if expect_up:
+                downtime_line = ""
+                with _lock:
+                    if _mains_down_started_at is not None:
+                        elapsed = time.time() - _mains_down_started_at
+                        adjusted = max(0, elapsed - EXTENDER_BOOT_LAG_SEC)
+                        downtime_line = f"\n⏱️ Approx mains downtime: ~{fmt_downtime(adjusted)}"
+                        _mains_down_started_at = None
                 send_telegram(
                     f"✅ <b>Proxmox Confirmed Online</b>\n\n"
                     f"Trigger: {trigger_label}\n⌚ Uptime: {prox_uptime}"
+                    f"{downtime_line}"
                 )
             else:
                 send_telegram(
@@ -529,8 +538,7 @@ def process_esp_notification(event):
                 _mains_down_started_at = None
         elif event == "shutdown_mains_start":
             _esp32_state["mainsUp"] = False
-            _esp32_state["sdMains"] = True
-            _mains_down_started_at = None   
+            _esp32_state["sdMains"] = True 
         elif event == "shutdown_wan_start":
             _esp32_state["wanUp"] = False
             _esp32_state["sdWAN"] = True
