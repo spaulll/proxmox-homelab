@@ -201,7 +201,7 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 
 ---
 
-## ⚡ ESP32 UPS Monitor — V5.2
+## ⚡ ESP32 UPS Monitor
 
 Monitors mains power (TCP → 192.168.0.2:80) and WAN (TCP → 8.8.8.8:53 / 1.1.1.1:53). Triggers graceful Proxmox shutdown on failure, restores via WOL. Telegram control via Pi ups-monitor.py.
 
