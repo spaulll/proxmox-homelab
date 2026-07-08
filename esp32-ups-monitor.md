@@ -222,7 +222,7 @@ Runs the central Telegram bot engine, long-polls updates, interacts with local S
 #!/usr/bin/env python3
 """
 UPS Monitor Brain — Pi (192.168.0.169)
-Version: 5.0 (Asynchronous Notification Ingestion and Event Controller)
+Version: 6.3 (Asynchronous Notification Ingestion and Event Controller)
 """
 
 import json
@@ -268,6 +268,7 @@ EXTENDER_BOOT_LAG_SEC    = 40         # 40 seconds approx time extender takes to
 
 
 LOG_FILE = "/var/log/ups-monitor.log"
+COUNTERS_FILE = "/tmp/ups-daily-counters.json"
 # ==================================================
 
 logging.basicConfig(
@@ -288,6 +289,7 @@ _esp32_alerted = False
 _tg_last_id    = -1
 _tg_session = requests.Session()
 _mains_down_started_at = None 
+_daily_counters = {"date": None, "mains_down": 0, "shutdowns": 0}
 
 # ==================================================
 # NETWORK OPERATIONS HELPERS
@@ -318,15 +320,20 @@ def _tcp_reachable(host, port, timeout=3):
 # TELEGRAM SERVICE CLIENT
 # ==================================================
 
-def _tg_request(method, params=None):
+def _tg_request(method, params=None, retries=2, retry_delay=2):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
     proxies = {"https": TG_PROXY, "http": TG_PROXY} if TG_PROXY else None
-    try:
-        r = _tg_session.get(url, params=params or {}, proxies=proxies, timeout=TG_POLL_TIMEOUT + 3)
-        return r.json()
-    except Exception as e:
-        log.warning(f"Telegram request failed: {e}")
-        return None
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = _tg_session.get(url, params=params or {}, proxies=proxies, timeout=TG_POLL_TIMEOUT + 3)
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(retry_delay)
+    log.warning(f"Telegram request failed after {retries + 1} attempts: {last_err}")
+    return None
 
 def send_telegram(text):
     result = _tg_request("sendMessage", {
@@ -361,6 +368,48 @@ def fmt_downtime(secs):
         return f"{mins}m {s}s"
     h, m = divmod(mins, 60)
     return f"{h}h {m}m"
+
+def _today_str():
+    return time.strftime("%Y-%m-%d")
+
+def _load_counters():
+    global _daily_counters
+    try:
+        with open(COUNTERS_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("date") == _today_str():
+            _daily_counters = data
+        else:
+            _daily_counters = {"date": _today_str(), "mains_down": 0, "shutdowns": 0}
+    except Exception:
+        _daily_counters = {"date": _today_str(), "mains_down": 0, "shutdowns": 0}
+
+def _save_counters():
+    try:
+        with open(COUNTERS_FILE, "w") as f:
+            json.dump(_daily_counters, f)
+    except Exception as e:
+        log.warning(f"Failed to persist daily counters: {e}")
+
+def _bump_counter(key):
+    """Increments a daily counter, resetting on date rollover. Call under _lock."""
+    today = _today_str()
+    if _daily_counters.get("date") != today:
+        _daily_counters["date"] = today
+        _daily_counters["mains_down"] = 0
+        _daily_counters["shutdowns"] = 0
+    _daily_counters[key] = _daily_counters.get(key, 0) + 1
+    _save_counters()
+
+def _get_counters():
+    today = _today_str()
+    with _lock:
+        if _daily_counters.get("date") != today:
+            _daily_counters["date"] = today
+            _daily_counters["mains_down"] = 0
+            _daily_counters["shutdowns"] = 0
+            _save_counters()
+        return dict(_daily_counters)
 
 def get_proxmox_uptime():
     if not _tcp_reachable(PROXMOX_IP, PROXMOX_PORT, timeout=3):
@@ -528,6 +577,7 @@ def process_esp_notification(event):
             _esp32_state["mainsUp"] = False
             _esp32_state["mainsFailSinceMs"] = 1  # Force metrics to reflect a running countdown
             _mains_down_started_at = time.time()
+            _bump_counter("mains_down")
         elif event == "mains_false_alarm" or event == "mains_restored_override_cleared":
             _esp32_state["mainsUp"] = True
             _esp32_state["mainsFailSinceMs"] = 0
@@ -539,9 +589,11 @@ def process_esp_notification(event):
         elif event == "shutdown_mains_start":
             _esp32_state["mainsUp"] = False
             _esp32_state["sdMains"] = True 
+            _bump_counter("shutdowns")
         elif event == "shutdown_wan_start":
             _esp32_state["wanUp"] = False
             _esp32_state["sdWAN"] = True
+            _bump_counter("shutdowns")
 
     mapping = {
         "esp_booted":
@@ -650,6 +702,9 @@ def build_status_message():
     prox_line  = f"{'🟢' if prox_up else '🔴'} Proxmox: {'ONLINE' if prox_up else 'OFFLINE'}  ⌚ {prox_uptime}"
     footer     = f"⚙️ {sd_reason}" if sd_reason else "⚙️ No active shutdown reason"
 
+    counters = _get_counters()
+    stats_line = f"📊 Today: {counters['mains_down']} mains down · {counters['shutdowns']} shutdown{'s' if counters['shutdowns'] != 1 else ''}"
+
     return (
         f"📊 UPS STATUS\n"
         f"━━━━━━━━━━━━━━\n"
@@ -657,10 +712,10 @@ def build_status_message():
         f"{wan_line}\n"
         f"{prox_line}\n"
         f"━━━━━━━━━━━━━━\n"
-        f"{footer}"
+        f"{footer}\n"
+        f"{stats_line}"
         f"{stale_note}"
     )
-
 
 # ==================================================
 # DIAGNOSIS CONTEXT ASSEMBLY
@@ -773,7 +828,10 @@ def telegram_poll_loop():
 
 if __name__ == "__main__":
     log.info("=== Decoupled UPS Brain System Initialization ===")
-    
+
+    with _lock:
+        _load_counters()
+
     # 1. Start notification server for immediate callback execution
     threading.Thread(target=start_webhook_server, daemon=True, name="webhook-srv").start()
     
