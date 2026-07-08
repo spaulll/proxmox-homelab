@@ -833,7 +833,7 @@ const char* WIFI_PASS    = "WIFI_PASSWORD";
 const uint8_t MAIN_ROUTER_BSSID[] = {0xCC, 0x28, 0xAA, 0xC0, 0xA2, 0x70}; 
 
 const char* OTA_PASSWORD = "OTA_PASSWORD";
-const char* FW_VERSION   = "V6.0";
+const char* FW_VERSION   = "V6.2";
 
 const char* PING_TARGET  = "192.168.0.2"; // Extender IP for checking mains status
 const int   PING_PORT    = 80;
@@ -872,6 +872,10 @@ unsigned long mainsFirstFailTime = 0;
 unsigned long wanFirstFailTime   = 0;
 unsigned long lastPingTime       = 0;
 unsigned long espBootTime        = 0;
+unsigned long shutdownIssuedAt   = 0;   // when shutdown_complete last fired
+
+// --- Settle timing ---
+const unsigned long MIN_SHUTDOWN_SETTLE_MS = 45000;  // min wait before wake-eligible
 
 // --- Cached sensor state (updated by main loop only) ---
 bool cachedMainsUp = false;
@@ -904,6 +908,7 @@ void saveState() {
     prefs.putBool("sdManual",     shutdownReasonManual);
     prefs.putBool("sdManMains",   manualOffWhileMainsDown);
     prefs.putBool("manOvr",       manualOverride);
+    prefs.putULong("sdIssuedAt",  shutdownIssuedAt); 
     prefs.end();
 }
 
@@ -916,6 +921,13 @@ void loadState() {
     manualOffWhileMainsDown = prefs.getBool("sdManMains", false);
     manualOverride          = prefs.getBool("manOvr",     false);
     prefs.end();
+
+    // if we're booting up already marked as "shut down" (e.g. ESP32
+    // itself rebooted mid-window), restart the settle timer from now rather
+    // than trusting a pre-reboot millis() value or defaulting to 0.
+    if (shutdownReasonMains || shutdownReasonWAN || shutdownReasonManual) {
+        shutdownIssuedAt = millis();
+    }
 }
 
 // ==================================================
@@ -1077,6 +1089,7 @@ void executeShutdownProxmox(String mode) {
     server.handleClient();
 
     notifyPi("shutdown_complete");
+    shutdownIssuedAt = millis();  
 }
 
 void executeWakeProxmox(String reason) {
@@ -1258,7 +1271,7 @@ void loop() {
     // ==================================================
     // AUTONOMOUS AUTOMATION & FAILSAFE ENGINE
     // ==================================================
-    if (isM900ShutDown()) {
+    if (isM900ShutDown() && (now - shutdownIssuedAt >= MIN_SHUTDOWN_SETTLE_MS)) {
         // Case 1: Auto-shutdown (mains/WAN) — restore when both back up
         if (!shutdownReasonManual) {
             if (mainsUp && wanUp) {
