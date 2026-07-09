@@ -874,7 +874,8 @@ Exposes a JSON telemetry api endpoint on `/state` via a lightweight local server
 * **Path:** `/mnt/data/public/esp32-ups-monitor/src/main.cpp`
 
 ```cpp
-// ESP firmware/ main.cpp - V5 Architecture (Decoupled & Optimized)
+// ESP firmware/ main.cpp
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -906,9 +907,15 @@ const char* M900_MAC     = "00:23:24:c7:1f:5d";
 // Target Pi notification endpoint
 const char* PI_NOTIFY_URL = "http://192.168.0.169:9997/notify";
 
-const unsigned long PING_INTERVAL_MS         = 15000;
-const unsigned long MAINS_FAILURE_TIMEOUT_MS = 300000;   // 5 min
-const unsigned long WAN_FAILURE_TIMEOUT_MS   = 600000;   // 10 min
+// --- Polling intervals (DECOUPLED: mains checked far more often than WAN) ---
+// Previously a single 15s interval was shared by both mains + WAN checks,
+// and since checks themselves could take up to ~7-8s under failure, the real
+// gap between mains samples could stretch to ~25s+ — long enough for a
+// 10-15s power blip to fall entirely between two samples and never be seen.
+const unsigned long MAINS_POLL_INTERVAL_MS   = 3000;    // fast mains sampling
+const unsigned long WAN_POLL_INTERVAL_MS     = 15000;   // unchanged cadence for WAN
+const unsigned long MAINS_FAILURE_TIMEOUT_MS = 300000;   // 5 min (unchanged)
+const unsigned long WAN_FAILURE_TIMEOUT_MS   = 600000;   // 10 min (unchanged)
 
 // Mains flap detection
 const int           FLAP_THRESHOLD  = 3;
@@ -928,14 +935,13 @@ bool mainsFailureStarted = false;
 bool wanFailureStarted   = false;
 unsigned long mainsFirstFailTime = 0;
 unsigned long wanFirstFailTime   = 0;
-unsigned long lastPingTime       = 0;
 unsigned long espBootTime        = 0;
 unsigned long shutdownIssuedAt   = 0;   // when shutdown_complete last fired
 
 // --- Settle timing ---
 const unsigned long MIN_SHUTDOWN_SETTLE_MS = 45000;  // min wait before wake-eligible
 
-// --- Cached sensor state (updated by main loop only) ---
+// --- Cached sensor state (updated by background tasks only) ---
 bool cachedMainsUp = false;
 bool cachedWanUp   = false;
 
@@ -950,8 +956,11 @@ String pendingCommand = "";
 WiFiUDP udp;
 WebServer server(80);
 
-// --- Background network-check task (runs on core 0, parallel to loop()/server on core 1) ---
-TaskHandle_t netCheckTaskHandle = NULL;
+// --- Background network-check tasks (run on core 0, parallel to loop()/server on core 1) ---
+// Mains and WAN are now checked by TWO SEPARATE tasks on their own schedules,
+// so a slow/failing WAN check can never delay how often mains is sampled.
+TaskHandle_t mainsCheckTaskHandle = NULL;
+TaskHandle_t wanCheckTaskHandle   = NULL;
 portMUX_TYPE cacheMux = portMUX_INITIALIZER_UNLOCKED; // guards cachedMainsUp/cachedWanUp
 
 // ==================================================
@@ -1009,19 +1018,16 @@ bool tcpCheck(const char* host, int port, int timeoutMs = 2000) {
     return result;
 }
 
+// --- Mains check: fast single-attempt, no internal retry loop ---
+// Previously this retried up to 3x with 500ms delays between attempts
+// (up to ~7.5s worst case per call). That made mains sampling slow to run,
+// which is exactly what caused the shared 15s task to drift and miss short
+// blips. Retry/confidence is now handled by the FAST POLL RATE instead
+// (MAINS_POLL_INTERVAL_MS = 3s) — a single missed sample gets corrected by
+// another sample 3 seconds later, rather than spending 7.5s trying to be
+// sure on any single sample.
 bool isMainsUp() {
-    const int MAINS_RETRY_COUNT     = 3;
-    const int MAINS_RETRY_DELAY_MS  = 500;
-
-    for (int attempt = 0; attempt < MAINS_RETRY_COUNT; attempt++) {
-        if (tcpCheck(PING_TARGET, PING_PORT)) {
-            return true;  // any single success = mains up, no need to keep retrying
-        }
-        if (attempt < MAINS_RETRY_COUNT - 1) {
-            delay(MAINS_RETRY_DELAY_MS);
-        }
-    }
-    return false;  // all attempts failed — only now treat as a real failure
+    return tcpCheck(PING_TARGET, PING_PORT, 800);
 }
 
 bool isWANUp() {
@@ -1035,24 +1041,37 @@ bool isM900ShutDown() {
 }
 
 // ==================================================
-// BACKGROUND NETWORK-CHECK TASK (core 0)
+// BACKGROUND NETWORK-CHECK TASKS (core 0)
 // ==================================================
-// Runs isMainsUp()/isWANUp() on their own core so the /state HTTP handler
-// (served from loop() on core 1) is never queued behind a blocking TCP
-// check. Writes results into cachedMainsUp/cachedWanUp under a spinlock.
-// Does not alter any timing, retry, or decision logic — isMainsUp() and
-// isWANUp() themselves are untouched.
-void netCheckTask(void *pvParameters) {
+// Split into two independent tasks so mains sampling is never delayed by a
+// slow/failing WAN check (or vice versa). Each writes its own cached value
+// under the same spinlock. Fixed-rate scheduling (vTaskDelayUntil) keeps the
+// polling interval accurate even if a given check takes a little time,
+// instead of stacking check-time on top of the wait like the old code did.
+
+void mainsCheckTask(void *pvParameters) {
+    TickType_t lastWake = xTaskGetTickCount();
     for (;;) {
         bool mainsUp = isMainsUp();
-        bool wanUp   = isWANUp();
 
         portENTER_CRITICAL(&cacheMux);
         cachedMainsUp = mainsUp;
-        cachedWanUp   = wanUp;
         portEXIT_CRITICAL(&cacheMux);
 
-        vTaskDelay(pdMS_TO_TICKS(PING_INTERVAL_MS));
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(MAINS_POLL_INTERVAL_MS));
+    }
+}
+
+void wanCheckTask(void *pvParameters) {
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        bool wanUp = isWANUp();
+
+        portENTER_CRITICAL(&cacheMux);
+        cachedWanUp = wanUp;
+        portEXIT_CRITICAL(&cacheMux);
+
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(WAN_POLL_INTERVAL_MS));
     }
 }
 
@@ -1261,15 +1280,26 @@ void setup() {
     server.on("/command", HTTP_POST, handlePostCommand); 
     server.begin();
 
-    // Launch mains/WAN checks on core 0, parallel to loop()/server on core 1,
-    // so /state is never queued behind a blocking TCP check.
+    // Launch mains + WAN checks as two SEPARATE tasks on core 0, parallel to
+    // loop()/server on core 1. Mains polls every 3s; WAN polls every 15s.
+    // Splitting them means a slow WAN check can never delay a mains sample.
     xTaskCreatePinnedToCore(
-        netCheckTask,
-        "netCheckTask",
+        mainsCheckTask,
+        "mainsCheckTask",
         4096,
         NULL,
         1,
-        &netCheckTaskHandle,
+        &mainsCheckTaskHandle,
+        0
+    );
+
+    xTaskCreatePinnedToCore(
+        wanCheckTask,
+        "wanCheckTask",
+        4096,
+        NULL,
+        1,
+        &wanCheckTaskHandle,
         0
     );
 
@@ -1281,6 +1311,12 @@ void setup() {
 // ==================================================
 // MAIN LOOP
 // ==================================================
+// Runs its own decision logic on a 3s cadence (matching the new fast mains
+// poll rate) instead of the old shared 15s cadence, so a blip that the
+// background task now catches isn't sat on for up to 15s before loop()
+// even looks at it.
+const unsigned long LOOP_DECISION_INTERVAL_MS = 3000;
+unsigned long lastDecisionTime = 0;
 
 void loop() {
     ArduinoOTA.handle();
@@ -1314,11 +1350,11 @@ void loop() {
     }
 
     unsigned long now = millis();
-    if (now - lastPingTime < PING_INTERVAL_MS) return;
-    lastPingTime = now;
+    if (now - lastDecisionTime < LOOP_DECISION_INTERVAL_MS) return;
+    lastDecisionTime = now;
 
-    // Checks now run on core 0 (netCheckTask); read the latest result here
-    // instead of blocking loop()/server with a direct call.
+    // Checks now run on core 0 (mainsCheckTask / wanCheckTask); read the
+    // latest cached results here instead of blocking loop()/server directly.
     portENTER_CRITICAL(&cacheMux);
     bool mainsUp = cachedMainsUp;
     bool wanUp   = cachedWanUp;
@@ -1387,6 +1423,7 @@ void loop() {
         }
     }
 }
+
 ```
 
 ---
