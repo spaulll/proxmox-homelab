@@ -215,17 +215,20 @@ Monitors mains power (TCP → 192.168.0.2:80) and WAN (TCP → 8.8.8.8:53 / 1.1.
 | --- | --- |
 | **ESP32 IP** | 192.168.0.178 (static) |
 | **OTA** | ArduinoOTA, hostname `esp32-ups-monitor`, password `password` |
-| **BSSID lock** | CC:28:AA:C0:A2:70 (Asus 2.4GHz) |
-| **Mains check** | TCP → 192.168.0.2:80 |
-| **WAN check** | TCP → 8.8.8.8:53 or 1.1.1.1:53 |
+| **BSSID lock** | CC:28:AA:C0:A2:70 (Asus 2.4GHz), enforced on connect + reconnect |
+| **Mains check** | TCP → 192.168.0.2:80, single-attempt, 800ms timeout |
+| **WAN check** | TCP → 8.8.8.8:53 or 1.1.1.1:53, 2000ms timeout each |
+| **Mains poll interval** | 3s (`mainsCheckTask`, core 0) |
+| **WAN poll interval** | 15s (`wanCheckTask`, core 0) |
+| **Loop decision interval** | 3s (core 1, reads cached results only) |
 | **Mains failure timeout** | 5 min |
 | **WAN failure timeout** | 10 min |
-| **Check interval** | 30s |
+| **Min shutdown settle** | 45s before wake-eligible |
 | **Shutdown webhook** | [http://192.168.0.50:9999/shutdown](http://192.168.0.50:9999/shutdown) (also /reboot) |
 | **WOL target** | MAC 00:23:24:c7:1f:5d, broadcast 192.168.0.255 |
 | **Pi notify URL** | [http://192.168.0.169:9997/notify?event=](http://192.168.0.169:9997/notify?event=)... |
 | **ESP32 state API** | GET [http://192.168.0.178/state](http://192.168.0.178/state) |
-| **ESP32 command API** | POST [http://192.168.0.178/command](http://192.168.0.178/command) |
+| **ESP32 command API** | POST [http://192.168.0.178/command](http://192.168.0.178/command) (deferred via `pendingCommand`, avoids re-entrancy crashes) |
 | **Flap detection** | 3 events / 10 min rolling window |
 | **Extender uptime** | [http://192.168.0.169:9998/extender-uptime](http://192.168.0.169:9998/extender-uptime) |
 
@@ -285,6 +288,7 @@ Monitors mains power (TCP → 192.168.0.2:80) and WAN (TCP → 8.8.8.8:53 / 1.1.
 | `wol_packet_sent` | WOL frame broadcast |
 | `wan_restored_mains_down_hold` | WAN back but mains still down, holding restore |
 
+> For more detailed technical details and code, see the [full ESP32 UPS Monitor doc](https://github.com/spaulll/proxmox-homelab/blob/main/esp32-ups-monitor.md).
 ---
 
 ## 🏗️ LXC 117 — ESP32 Builder
