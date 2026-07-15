@@ -291,6 +291,12 @@ _tg_session = requests.Session()
 _mains_down_started_at = None 
 _daily_counters = {"date": None, "mains_down": 0, "shutdowns": 0}
 
+# Reconciliation: tracks how long Proxmox has been continuously confirmed
+# online while the ESP32 still thinks it's shut down (e.g. BIOS auto-power-on
+# after a UPS-draining outage, bypassing WOL entirely).
+_prox_online_since = None
+RECONCILE_MIN_ONLINE_SEC = 150   # must be online this long before we touch flags
+
 # ==================================================
 # NETWORK OPERATIONS HELPERS
 # ==================================================
@@ -504,9 +510,52 @@ def start_verification(expect_up, trigger_label, timeout_sec=120, interval_sec=1
         args=(expect_up, trigger_label, timeout_sec, interval_sec),
         daemon=True,
     ).start()
+    
 # ==================================================
 # ESP32 POLLING DAEMON
 # ==================================================
+
+def _check_bios_reconciliation(state):
+    """
+    If the ESP32 still believes Proxmox is shut down (any sdMains/sdWAN/
+    sdManual flag set) but Proxmox has been confirmed ONLINE continuously
+    for RECONCILE_MIN_ONLINE_SEC, it almost certainly booted on its own
+    (BIOS 'power on after AC loss') without going through executeWakeProxmox().
+    Force a wake command to clear the stale flags.
+
+    Deliberately does NOT trigger on mains/WAN health alone — only on
+    Proxmox's actual confirmed online state, so a genuine manual /off
+    (where Proxmox stays truly offline) is never touched.
+    """
+    global _prox_online_since
+
+    if not state:
+        return
+    flags_stuck = state.get("sdMains") or state.get("sdWAN") or state.get("sdManual")
+    if not flags_stuck:
+        _prox_online_since = None
+        return
+
+    prox_up, _ = get_proxmox_uptime()
+    if not prox_up:
+        _prox_online_since = None
+        return
+
+    now = time.time()
+    if _prox_online_since is None:
+        _prox_online_since = now
+        return
+
+    if now - _prox_online_since >= RECONCILE_MIN_ONLINE_SEC:
+        log.warning("Reconciling stale shutdown flags — Proxmox online without WOL trigger.")
+        _send_esp32_command({"cmd": "wake"})
+        send_telegram(
+            "⚠️ <b>Flags Reconciled</b>\n\n"
+            "Proxmox has been online for 2.5+ min but the ESP32 still had a "
+            "shutdown flag set (likely BIOS auto-power-on after mains restored, "
+            "bypassing WOL). Sent a wake command to clear stale flags."
+        )
+        _prox_online_since = None
 
 def esp32_poll_loop():
     global _esp32_fail, _esp32_alerted, _esp32_state
@@ -533,6 +582,9 @@ def esp32_poll_loop():
             send_telegram(f"✅ <b>ESP32 BACK ONLINE</b>\n\nUPS sensor ({ESP32_IP}) recovered.\nFirmware: {recovery_fw}")
         elif alert_dead:
             send_telegram(f"⚠️ <b>ESP32 UNREACHABLE</b>\n\nSensor missed metrics. Authority systems remain autonomous.")
+
+        if state is not None:
+            _check_bios_reconciliation(state)
 
         with _lock:
             fail_count = _esp32_fail
@@ -604,6 +656,8 @@ def process_esp_notification(event):
             "⚠️ <b>Mains Down</b>\n\nCan't reach 192.168.0.2. Shutdown in <b>5 minutes</b> if not restored.",
         "mains_down_override_active":
             "⚠️ <b>Mains Down</b>\n\nManual override is active — auto-shutdown suppressed. Send /off to shut down manually.",
+        "mains_down_shutdown_suppressed":
+            "🚨 <b>Mains Down — SHUTDOWN SUPPRESSED</b>\n\nA shutdown flag is already stuck set (sdMains/sdWAN/sdManual) so auto-shutdown will NOT fire. This is likely a stale flag from a previous event. Run /diag and reconcile — Proxmox is currently unprotected.",
         "mains_false_alarm":
             "✅ <b>Mains Restored</b>\n\nLine recovered before the 5 min timeout. No action taken."
             + (f"\n⏱️ Approx downtime: ~{approx_downtime_str}" if approx_downtime_str else ""),
@@ -867,7 +921,7 @@ Enable: `sudo systemctl enable --now ups-monitor`
 
 ---
 
-## Part 2: ESP32 Firmware (V5 Decoupled)
+## Part 2: ESP32 Firmware
 
 Exposes a JSON telemetry api endpoint on `/state` via a lightweight local server and listens for deferred inputs over `/command`.
 
@@ -1381,12 +1435,21 @@ void loop() {
         }
     }
 
-    // FAILURE DETECTION — MAINS
+// FAILURE DETECTION — MAINS
     if (!mainsUp) {
         if (!mainsFailureStarted) {
             mainsFailureStarted = true;
             mainsFirstFailTime  = now;
-            if (wanUp) notifyPi(manualOverride ? "mains_down_override_active" : "mains_down_countdown_start");
+            if (wanUp) {
+                if (isM900ShutDown()) {
+                    // A shutdown flag (likely stale sdManual) is already set —
+                    // executeShutdownProxmox() will silently no-op below.
+                    // Surface that explicitly instead of sending a normal countdown.
+                    notifyPi("mains_down_shutdown_suppressed");
+                } else {
+                    notifyPi(manualOverride ? "mains_down_override_active" : "mains_down_countdown_start");
+                }
+            }
         }
         if (!manualOverride && !isM900ShutDown() && (now - mainsFirstFailTime >= MAINS_FAILURE_TIMEOUT_MS)) {
             executeShutdownProxmox("mains");
