@@ -351,10 +351,10 @@ Client-side encrypted via rclone crypt remote `b2immichcrypt`.
 | `immich-db-backup.sh` | Syncs /mnt/nas/upload/backups → b2immichcrypt:immich-db |
 | `immich-backup-report.sh` | Sends email summary after backup |
 
-* **Scripts:** `/usr/local/bin/immich-backup/` | **Logs:** `/var/log/immich-*`
+* **Scripts:** `/usr/local/bin/immich-backup/` | **Logs:** `/var/log/immich-*` 
 * **Status files:** `/var/lib/immich-backup/`
 * **Safety:** aborts if local count < 70% of remote (library) or < 50% (DB); 3x retries
-
+> 📁 Scripts: [`Immich-backup/`](./Immich-backup/) in this repo
 ---
 
 ## 💾 Proxmox LXC Backup — Backblaze B2
