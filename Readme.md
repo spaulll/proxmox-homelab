@@ -362,7 +362,7 @@ Client-side encrypted via rclone crypt remote `b2immichcrypt`.
 | [immich-data-backup-flow.sh](./Immich-backup/immich-data-backup-flow.sh) | Master — runs all three below in sequence |
 | [immich-library-backup.sh](./Immich-backup/immich-library-backup.sh) | Syncs /mnt/nas/upload/library → b2immichcrypt:immich-library |
 | [immich-db-backup.sh](./Immich-backup/immich-db-backup.sh) | Syncs /mnt/nas/upload/backups → b2immichcrypt:immich-db |
-| [immich-backup-report.sh](./Immich-backup/immich-backup-report.sh) | Sends email summary after backup |
+| [immich-backup-report.sh](./Immich-backup/immich-backup-report.sh) | Sends telegram message summary after backup |
 
 * **Scripts:** `/usr/local/bin/immich-backup/` | **Logs:** `/var/log/immich-*`
 * **Status files:** `/var/lib/immich-backup/`
