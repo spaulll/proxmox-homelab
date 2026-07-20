@@ -15,6 +15,15 @@
 
 Personal homelab running on a single Proxmox VE node with LXC containers for all services. Internal network routed via OpenWrt LXC. Remote access via Tailscale and Nginx Proxy Manager with Let's Encrypt SSL.
 
+## 📚 Sub-Documentation
+
+| Doc | Covers |
+|---|---|
+| [esp32-ups-monitor.md](./esp32-ups-monitor.md) | ESP32 UPS Monitor firmware, NVS flags, restore logic, notification events |
+| [lxc-backup-b2.md](./lxc-backup-b2.md) | Proxmox LXC → Backblaze B2 backup script, schedule, retention |
+| [tg-proxy.md](./tg-proxy.md) | LXC 118 Telegram SOCKS5 proxy, WireGuard rotation config |
+| [Immich-backup/README.md](./Immich-backup/README.md) | Immich photo backup pipeline to Backblaze B2 (LXC 109) |
+
 ---
 
 ## 🖥️ Host Node — `prox`
@@ -124,15 +133,15 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 | 105 | NAS | Samba/SMB — exposes /mnt/data to LAN |
 | 106 | openwrt | Router/gateway + DHCP for vmbr1 |
 | 107 | adguard | AdGuard Home — primary DNS, Keepalived MASTER |
-| 109 | immich | Immich photo backup, HW transcoding via /dev/dri |
+| 109 | immich | Immich photo backup, HW transcoding via /dev/dri (see [Immich-backup/README.md](./Immich-backup/README.md)) |
 | 110 | tailscale-LXC | Tailscale subnet router (both subnets) |
 | 111 | filebrowser | Filebrowser web UI for /mnt/data |
 | 112 | opencode | OpenCode AI assistant (stopped, onboot=0) |
 | 113 | warp-exit | Cloudflare WARP egress + Tailscale exit node |
 | 115 | openwebui | Open WebUI for LLMs (stopped, onboot=0) |
 | 116 | syncthing | Syncthing continuous file sync |
-| 117 | esp32-builder | PlatformIO build + OTA push for ESP32 (stopped, onboot=0) |
-| 118 | tg-proxy | SOCKS5 proxy (GOST) via ProtonVPN WireGuard |
+| 117 | esp32-builder | PlatformIO build + OTA push for ESP32 (stopped, onboot=0) (see [esp32-ups-monitor.md](./esp32-ups-monitor.md)) |
+| 118 | tg-proxy | SOCKS5 proxy (GOST) via ProtonVPN WireGuard (see [tg-proxy.md](./tg-proxy.md)) |
 
 ---
 
@@ -201,7 +210,9 @@ vmbr1 (internal): OpenWrt eth1 → gw 10.10.10.1
 
 ---
 
-## ⚡ ESP32 UPS Monitor
+## ⚡ ESP32 UPS Monitor — V5.2
+
+> 📄 Full details: [esp32-ups-monitor.md](./esp32-ups-monitor.md)
 
 Monitors mains power (TCP → 192.168.0.2:80) and WAN (TCP → 8.8.8.8:53 / 1.1.1.1:53). Triggers graceful Proxmox shutdown on failure, restores via WOL. Telegram control via Pi ups-monitor.py.
 
@@ -215,20 +226,17 @@ Monitors mains power (TCP → 192.168.0.2:80) and WAN (TCP → 8.8.8.8:53 / 1.1.
 | --- | --- |
 | **ESP32 IP** | 192.168.0.178 (static) |
 | **OTA** | ArduinoOTA, hostname `esp32-ups-monitor`, password `password` |
-| **BSSID lock** | CC:28:AA:C0:A2:70 (Asus 2.4GHz), enforced on connect + reconnect |
-| **Mains check** | TCP → 192.168.0.2:80, single-attempt, 800ms timeout |
-| **WAN check** | TCP → 8.8.8.8:53 or 1.1.1.1:53, 2000ms timeout each |
-| **Mains poll interval** | 3s (`mainsCheckTask`, core 0) |
-| **WAN poll interval** | 15s (`wanCheckTask`, core 0) |
-| **Loop decision interval** | 3s (core 1, reads cached results only) |
+| **BSSID lock** | CC:28:AA:C0:A2:70 (Asus 2.4GHz) |
+| **Mains check** | TCP → 192.168.0.2:80 |
+| **WAN check** | TCP → 8.8.8.8:53 or 1.1.1.1:53 |
 | **Mains failure timeout** | 5 min |
 | **WAN failure timeout** | 10 min |
-| **Min shutdown settle** | 45s before wake-eligible |
+| **Check interval** | 30s |
 | **Shutdown webhook** | [http://192.168.0.50:9999/shutdown](http://192.168.0.50:9999/shutdown) (also /reboot) |
 | **WOL target** | MAC 00:23:24:c7:1f:5d, broadcast 192.168.0.255 |
 | **Pi notify URL** | [http://192.168.0.169:9997/notify?event=](http://192.168.0.169:9997/notify?event=)... |
 | **ESP32 state API** | GET [http://192.168.0.178/state](http://192.168.0.178/state) |
-| **ESP32 command API** | POST [http://192.168.0.178/command](http://192.168.0.178/command) (deferred via `pendingCommand`, avoids re-entrancy crashes) |
+| **ESP32 command API** | POST [http://192.168.0.178/command](http://192.168.0.178/command) |
 | **Flap detection** | 3 events / 10 min rolling window |
 | **Extender uptime** | [http://192.168.0.169:9998/extender-uptime](http://192.168.0.169:9998/extender-uptime) |
 
@@ -288,10 +296,11 @@ Monitors mains power (TCP → 192.168.0.2:80) and WAN (TCP → 8.8.8.8:53 / 1.1.
 | `wol_packet_sent` | WOL frame broadcast |
 | `wan_restored_mains_down_hold` | WAN back but mains still down, holding restore |
 
-> For more detailed technical details and code, see the [full ESP32 UPS Monitor doc](https://github.com/spaulll/proxmox-homelab/blob/main/esp32-ups-monitor.md).
 ---
 
 ## 🏗️ LXC 117 — ESP32 Builder
+
+> 📄 Full details: [esp32-ups-monitor.md](./esp32-ups-monitor.md)
 
 Start manually when needed: `pct start 117` → edit `main.cpp` via SMB → Telegram 🚀 on build → `pct stop 117`
 SMB path: `\\192.168.0.10\public\esp32-ups-monitor\src\main.cpp`
@@ -321,6 +330,8 @@ Cloudflare WARP full-tunnel + Tailscale exit node.
 
 ## ✈️ LXC 118 — Telegram SOCKS5 Proxy
 
+> 📄 Full details: [tg-proxy.md](./tg-proxy.md)
+
 GOST SOCKS5 on `:8388` (user/pass auth) routed through ProtonVPN WireGuard full-tunnel.
 
 **WireGuard:**
@@ -342,22 +353,26 @@ OpenWrt MASQUERADE rule required for LAN (`192.168.0.0/24`) clients to reach vmb
 
 ## 📸 Immich Backup — Backblaze B2 (LXC 109)
 
+> 📄 Full details: [Immich-backup/README.md](./Immich-backup/README.md)
+
 Client-side encrypted via rclone crypt remote `b2immichcrypt`.
 
 | Script | Purpose |
 | --- | --- |
-| `immich-data-backup-flow.sh` | Master — runs all three below in sequence |
-| `immich-library-backup.sh` | Syncs /mnt/nas/upload/library → b2immichcrypt:immich-library |
-| `immich-db-backup.sh` | Syncs /mnt/nas/upload/backups → b2immichcrypt:immich-db |
-| `immich-backup-report.sh` | Sends email summary after backup |
+| [immich-data-backup-flow.sh](./Immich-backup/immich-data-backup-flow.sh) | Master — runs all three below in sequence |
+| [immich-library-backup.sh](./Immich-backup/immich-library-backup.sh) | Syncs /mnt/nas/upload/library → b2immichcrypt:immich-library |
+| [immich-db-backup.sh](./Immich-backup/immich-db-backup.sh) | Syncs /mnt/nas/upload/backups → b2immichcrypt:immich-db |
+| [immich-backup-report.sh](./Immich-backup/immich-backup-report.sh) | Sends email summary after backup |
 
-* **Scripts:** `/usr/local/bin/immich-backup/` | **Logs:** `/var/log/immich-*` 
+* **Scripts:** `/usr/local/bin/immich-backup/` | **Logs:** `/var/log/immich-*`
 * **Status files:** `/var/lib/immich-backup/`
 * **Safety:** aborts if local count < 70% of remote (library) or < 50% (DB); 3x retries
-> 📁 Scripts: [`Immich-backup/`](./Immich-backup/) in this repo
+
 ---
 
 ## 💾 Proxmox LXC Backup — Backblaze B2
+
+> 📄 Full details: [lxc-backup-b2.md](./lxc-backup-b2.md)
 
 | Parameter | Value |
 | --- | --- |
