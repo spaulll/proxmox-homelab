@@ -227,6 +227,7 @@ Version: 6.3 (Asynchronous Notification Ingestion and Event Controller)
 
 import json
 import logging
+import os
 import socket
 import ssl
 import http.client
@@ -268,7 +269,7 @@ EXTENDER_BOOT_LAG_SEC    = 40         # 40 seconds approx time extender takes to
 
 
 LOG_FILE = "/var/log/ups-monitor.log"
-COUNTERS_FILE = "/tmp/ups-daily-counters.json"
+COUNTERS_FILE = "/var/lib/ups-monitor/daily-counters.json"
 # ==================================================
 
 logging.basicConfig(
@@ -392,8 +393,11 @@ def _load_counters():
 
 def _save_counters():
     try:
-        with open(COUNTERS_FILE, "w") as f:
+        os.makedirs(os.path.dirname(COUNTERS_FILE), exist_ok=True)
+        tmp_path = COUNTERS_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(_daily_counters, f)
+        os.replace(tmp_path, COUNTERS_FILE)  # atomic on same filesystem
     except Exception as e:
         log.warning(f"Failed to persist daily counters: {e}")
 
@@ -945,8 +949,8 @@ const char* WIFI_PASS    = "WIFI_PASSWORD";
 // --- HARDWARE LOCK: Bound strictly to the Main Router's 2.4GHz BSSID ---
 const uint8_t MAIN_ROUTER_BSSID[] = {0xCC, 0x28, 0xAA, 0xC0, 0xA2, 0x70}; 
 
-const char* OTA_PASSWORD = "OTA_PASSWORD";
-const char* FW_VERSION   = "V6.2";
+const char* OTA_PASSWORD = "password";
+const char* FW_VERSION   = "V6.4";
 
 const char* PING_TARGET  = "192.168.0.2"; // Extender IP for checking mains status
 const int   PING_PORT    = 80;
