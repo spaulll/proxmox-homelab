@@ -349,7 +349,9 @@ def send_telegram(text):
         "parse_mode": "HTML",
     })
     if not result or not result.get("ok"):
-        log.warning(f"sendMessage dropped payload: {result}")
+        log.error(f"FATAL: Telegram dropped payload (WAN down?): {result}")
+        return False
+    return True
 
 # ==================================================
 # CORE LOGIC AGGREGATORS
@@ -579,13 +581,16 @@ def esp32_poll_loop():
             else:
                 _esp32_fail += 1
                 if _esp32_fail >= ESP32_DEAD_THRESH and not _esp32_alerted:
-                    _esp32_alerted = True
+                    # Do not set _esp32_alerted to True here yet!
                     alert_dead = True
         
         if alert_recovery:
             send_telegram(f"✅ <b>ESP32 BACK ONLINE</b>\n\nUPS sensor ({ESP32_IP}) recovered.\nFirmware: {recovery_fw}")
         elif alert_dead:
-            send_telegram(f"⚠️ <b>ESP32 UNREACHABLE</b>\n\nSensor missed metrics. Authority systems remain autonomous.")
+            success = send_telegram(f"⚠️ <b>ESP32 UNREACHABLE</b>\n\nSensor missed metrics. Authority systems remain autonomous.")
+            with _lock:
+                if success:
+                    _esp32_alerted = True # Only lock out future alerts if we actually told the user
 
         if state is not None:
             _check_bios_reconciliation(state)
@@ -990,6 +995,7 @@ bool manualOverride            = false;   // manual /on while mains down — sup
 // --- Live state ---
 bool wakeExecuted = false; 
 bool mainsFailureStarted = false;
+bool mainsDownNotified   = false;
 bool wanFailureStarted   = false;
 unsigned long mainsFirstFailTime = 0;
 unsigned long wanFirstFailTime   = 0;
@@ -1061,8 +1067,9 @@ void loadState() {
 
 void notifyPi(String eventType) {
     if (WiFi.status() != WL_CONNECTED) return;
+    WiFiClient client;
     HTTPClient http;
-    http.begin(String(PI_NOTIFY_URL) + "?event=" + eventType);
+    http.begin(client, String(PI_NOTIFY_URL) + "?event=" + eventType);
     http.setTimeout(2000);
     http.GET();
     http.end();
@@ -1177,11 +1184,20 @@ void recordMainsFlap() {
 void checkFlapReset() {
     if (flapCount == 0) return;
     unsigned long now = millis();
-    int lastIdx = (flapCount < 10) ? flapCount - 1 : 9;
-    if ((now - flapTimestamps[lastIdx]) > FLAP_WINDOW_MS) {
-        flapCount  = 0;
-        flapWarned = false;
-        Serial.println("Flap window expired — counter reset");
+    int validFlaps = 0;
+    
+    // Shift unexpired flaps to the front of the array
+    for (int i = 0; i < flapCount; i++) {
+        if ((now - flapTimestamps[i]) <= FLAP_WINDOW_MS) {
+            flapTimestamps[validFlaps] = flapTimestamps[i];
+            validFlaps++;
+        }
+    }
+    
+    if (flapCount != validFlaps) {
+        flapCount = validFlaps;
+        if (flapCount < FLAP_THRESHOLD) flapWarned = false; // Clear warning lock if we drop below threshold
+        Serial.println("Old flaps expired — array compacted");
     }
 }
 
@@ -1215,8 +1231,9 @@ void executeShutdownProxmox(String mode) {
     saveState();
 
     // Fire Proxmox Hook — tighter timeout, pump server immediately after
+    WiFiClient client;                // <--- Add this line
     HTTPClient http;
-    http.begin(SHUTDOWN_URL);
+    http.begin(client, SHUTDOWN_URL); // <--- Pass the client object here
     http.setTimeout(1000);
     http.GET();
     http.end();
@@ -1346,7 +1363,7 @@ void setup() {
         "mainsCheckTask",
         4096,
         NULL,
-        1,
+        2,
         &mainsCheckTaskHandle,
         0
     );
@@ -1377,6 +1394,8 @@ const unsigned long LOOP_DECISION_INTERVAL_MS = 3000;
 unsigned long lastDecisionTime = 0;
 
 void loop() {
+    delay(2); // Yields core execution to RTOS background tasks
+
     ArduinoOTA.handle();
     server.handleClient();
 
@@ -1439,38 +1458,45 @@ void loop() {
         }
     }
 
-// FAILURE DETECTION — MAINS
+    // FAILURE DETECTION — MAINS
     if (!mainsUp) {
         if (!mainsFailureStarted) {
             mainsFailureStarted = true;
             mainsFirstFailTime  = now;
-            if (wanUp) {
-                if (isM900ShutDown()) {
-                    // A shutdown flag (likely stale sdManual) is already set —
-                    // executeShutdownProxmox() will silently no-op below.
-                    // Surface that explicitly instead of sending a normal countdown.
-                    notifyPi("mains_down_shutdown_suppressed");
-                } else {
-                    notifyPi(manualOverride ? "mains_down_override_active" : "mains_down_countdown_start");
-                }
+        }
+        
+        // DEBOUNCE: Only notify Pi if down for > 5 seconds.
+        if (!mainsDownNotified && (now - mainsFirstFailTime >= 5000)) {
+            mainsDownNotified = true; // <--- Just use the global variable directly
+            if (isM900ShutDown()) {
+                notifyPi("mains_down_shutdown_suppressed");
+            } else {
+                notifyPi(manualOverride ? "mains_down_override_active" : "mains_down_countdown_start");
             }
         }
+
         if (!manualOverride && !isM900ShutDown() && (now - mainsFirstFailTime >= MAINS_FAILURE_TIMEOUT_MS)) {
             executeShutdownProxmox("mains");
         }
     } else {
         if (mainsFailureStarted) {
+            unsigned long failDuration = now - mainsFirstFailTime;
             mainsFailureStarted = false;
             mainsFirstFailTime  = 0;
-            if (manualOverride) {
-                manualOverride = false;
-                saveState();
-                notifyPi("mains_restored_override_cleared");
-            } else if (!isM900ShutDown() && !wakeExecuted) {
-                recordMainsFlap();
-                notifyPi("mains_false_alarm");
+            
+            // Only trigger recovery logic if we actually sent a failure notification
+            if (failDuration >= 5000) { 
+                if (manualOverride) {
+                    manualOverride = false;
+                    saveState();
+                    notifyPi("mains_restored_override_cleared");
+                } else if (!isM900ShutDown() && !wakeExecuted) {
+                    recordMainsFlap();
+                    notifyPi("mains_false_alarm");
+                }
             }
             wakeExecuted = false;
+            mainsDownNotified = false; // <--- Reset the global variable cleanly
         }
     }
 
