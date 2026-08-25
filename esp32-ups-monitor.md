@@ -23,7 +23,8 @@ This document outlines the complete setup for the decentralized V5 ESP32-based U
 - Tracks 3 shutdown-reason flags (`sdMains`, `sdWAN`, `sdManual` + `manualOffWhileMainsDown`) persisted in NVS, governing auto-restore eligibility
 - `manualOverride` flag suppresses mains auto-shutdown when `/on` sent while mains is down
 - Flap detection: 3+ mains recoveries in 10 min → one-time alert
-- BSSID-locked Wi-Fi (`CC:28:AA:C0:A2:70`) on connect + reconnect, prevents roaming to the extender
+- Runtime-adjustable mains-failure timeout (default 5 min) set from the Pi via `/command`, persisted in NVS, reported as `mainsDelayMs` in `/state`
+- BSSID-locked Wi-Fi (locked to the main router's BSSID) on connect + reconnect, prevents roaming to the extender
 - OTA via `ArduinoOTA`
 
 ## Pi Brain (`ups-monitor.py`) — What it does
@@ -31,7 +32,7 @@ This document outlines the complete setup for the decentralized V5 ESP32-based U
 - Polls ESP32 `/state` every 15s (background thread); after 3 fails (~45s) sends "unreachable" alert with exponential backoff (cap 60s), sends recovery alert when polling resumes
 - Runs webhook server on `:9997` to catch instant ESP32 events, patches cached state in real time (e.g. `mains_down_countdown_start`)
 - Formats and sends all Telegram messages (ESP32 no longer talks to Telegram directly)
-- Handles Telegram long-polling + commands: `/status` (mains/WAN/Proxmox + live countdown), `/diag` (RSSI, heap, firmware, flaps, overrides), `/on`, `/off` (both gated on ESP32 reachability + current Proxmox state)
+- Handles Telegram long-polling + commands: `/status` (mains/WAN/Proxmox + live countdown), `/diag` (RSSI, heap, firmware, flaps, overrides, delay), `/on`, `/off` (both gated on ESP32 reachability + current Proxmox state), `/custom_delay` (set/reset/show the mains auto-shutdown delay, 1–720 min; `/custom-delay` hyphen alias also accepted)
 - Queries Proxmox API (`:8006`) and extender-uptime bridge (`:9998`) directly and independently of ESP32
 - Verifies shutdown/wake outcomes by polling Proxmox for up to 120s post-trigger, sends confirmation or timeout warning
 - Optional SOCKS5 proxy for Telegram traffic (`TG_PROXY`, currently `None`)
@@ -90,8 +91,8 @@ import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 EXTENDER_IP = "192.168.0.2"
-TELNET_USER = "admin"
-TELNET_PASS = "1"
+TELNET_USER = "TELNET_USER"
+TELNET_PASS = "TELNET_PASS"
 
 _lock = threading.Lock()
 
@@ -222,7 +223,7 @@ Runs the central Telegram bot engine, long-polls updates, interacts with local S
 #!/usr/bin/env python3
 """
 UPS Monitor Brain — Pi (192.168.0.169)
-Version: 6.3 (Asynchronous Notification Ingestion and Event Controller)
+Version: 6.4 (Custom mains-failure delay via /custom-delay)
 """
 
 import json
@@ -242,7 +243,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 ESP32_IP            = "192.168.0.178"
 ESP32_PORT          = 80
 ESP32_POLL_INTERVAL = 15        # seconds between state polls
-ESP32_TIMEOUT       = 12         # per-request timeout
+ESP32_TIMEOUT       = 12
 ESP32_DEAD_THRESH   = 3         # consecutive failures → alert
 
 PROXMOX_IP          = "192.168.0.50"
@@ -282,6 +283,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Fail fast (and clearly) if a SOCKS proxy is configured without PySocks
+if TG_PROXY and TG_PROXY.startswith("socks"):
+    try:
+        import socks  # noqa: F401  — provided by PySocks, required for socks5h://
+    except ImportError:
+        log.error("TG_PROXY is set but PySocks is missing (pip install requests[socks]) — disabling proxy.")
+        TG_PROXY = None
+
 # --- Shared State ---
 _lock          = threading.Lock()
 _esp32_state   = {}       
@@ -289,6 +298,7 @@ _esp32_fail    = 0
 _esp32_alerted = False    
 _tg_last_id    = -1
 _tg_session = requests.Session()
+_tg_lock = threading.Lock()  # requests.Session is not officially thread-safe
 _mains_down_started_at = None 
 _daily_counters = {"date": None, "mains_down": 0, "shutdowns": 0}
 
@@ -333,7 +343,8 @@ def _tg_request(method, params=None, retries=2, retry_delay=2):
     last_err = None
     for attempt in range(retries + 1):
         try:
-            r = _tg_session.get(url, params=params or {}, proxies=proxies, timeout=TG_POLL_TIMEOUT + 3)
+            with _tg_lock:
+                r = _tg_session.get(url, params=params or {}, proxies=proxies, timeout=TG_POLL_TIMEOUT + 3)
             return r.json()
         except Exception as e:
             last_err = e
@@ -424,6 +435,10 @@ def _get_counters():
         return dict(_daily_counters)
 
 def get_proxmox_uptime():
+    # NOTE: TCP reachability counts as "online" on purpose — for a UPS monitor,
+    # a node still accepting connections means it has power. A hard-hung node
+    # that keeps listening will simply never confirm "offline" and hit the
+    # verification timeout warning instead, which is the desired failsafe.
     if not _tcp_reachable(PROXMOX_IP, PROXMOX_PORT, timeout=3):
         return False, "Offline"
     try:
@@ -619,42 +634,60 @@ class ESPNotifyHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"OK")
             
             if event_type:
-                threading.Thread(target=process_esp_notification, args=(event_type,)).start()
+                mins_raw = params.get("mins", [None])[0]
+                threading.Thread(target=process_esp_notification, args=(event_type, mins_raw)).start()
         else:
             self.send_response(404)
             self.end_headers()
 
     def log_message(self, format, *args): pass
 
-def process_esp_notification(event):
-    log.info(f"Asynchronous webhook hit from ESP32: event={event}")
+def _patch_esp32_state(patch):
+    """
+    Applies realtime corrections to the cached ESP32 state. Only patches
+    after a real poll has populated the cache — never fabricates partial
+    state (a partial dict would make build_status_message() report bogus
+    defaults like "WAN DOWN" before the first successful poll).
+    Call under _lock.
+    """
+    if _esp32_state:
+        _esp32_state.update(patch)
+
+def process_esp_notification(event, mins_raw=None):
+    log.info(f"Asynchronous webhook hit from ESP32: event={event} mins={mins_raw}")
     global _esp32_state, _mains_down_started_at
 
     approx_downtime_str = None  # populated only on a real restore-from-down event
 
+    # ESP32 reports its current (possibly custom) mains delay in the
+    # countdown-start webhook so the Telegram message is always accurate.
+    countdown_mins_txt = None
+    if mins_raw:
+        try:
+            m = max(1, int(str(mins_raw)))
+            countdown_mins_txt = f"{m} minute{'s' if m != 1 else ''}"
+        except (TypeError, ValueError):
+            pass
+
     # --- Real-Time State Overrides to Prevent Cache Stodginess ---
     with _lock:
         if event == "mains_down_countdown_start":
-            _esp32_state["mainsUp"] = False
-            _esp32_state["mainsFailSinceMs"] = 1  # Force metrics to reflect a running countdown
             _mains_down_started_at = time.time()
             _bump_counter("mains_down")
+            _patch_esp32_state({"mainsUp": False, "mainsFailSinceMs": 1})  # Force metrics to reflect a running countdown
         elif event == "mains_false_alarm" or event == "mains_restored_override_cleared":
-            _esp32_state["mainsUp"] = True
-            _esp32_state["mainsFailSinceMs"] = 0
             if _mains_down_started_at is not None:
                 elapsed = time.time() - _mains_down_started_at
                 adjusted = max(0, elapsed - EXTENDER_BOOT_LAG_SEC)
                 approx_downtime_str = fmt_downtime(adjusted)
                 _mains_down_started_at = None
+            _patch_esp32_state({"mainsUp": True, "mainsFailSinceMs": 0})
         elif event == "shutdown_mains_start":
-            _esp32_state["mainsUp"] = False
-            _esp32_state["sdMains"] = True 
             _bump_counter("shutdowns")
+            _patch_esp32_state({"mainsUp": False, "sdMains": True})
         elif event == "shutdown_wan_start":
-            _esp32_state["wanUp"] = False
-            _esp32_state["sdWAN"] = True
             _bump_counter("shutdowns")
+            _patch_esp32_state({"wanUp": False, "sdWAN": True})
 
     mapping = {
         "esp_booted":
@@ -662,7 +695,8 @@ def process_esp_notification(event):
         "power_instability":
             "⚡ <b>Power Instability</b>\n\nMains has flapped 3+ times in the last 10 minutes. Worth checking the supply.",
         "mains_down_countdown_start":
-            "⚠️ <b>Mains Down</b>\n\nCan't reach 192.168.0.2. Shutdown in <b>5 minutes</b> if not restored.",
+            "⚠️ <b>Mains Down</b>\n\nCan't reach 192.168.0.2. Shutdown in <b>"
+            + (countdown_mins_txt or "5 minutes") + "</b> if not restored.",
         "mains_down_override_active":
             "⚠️ <b>Mains Down</b>\n\nManual override is active — auto-shutdown suppressed. Send /off to shut down manually.",
         "mains_down_shutdown_suppressed":
@@ -686,12 +720,12 @@ def process_esp_notification(event):
         "restoring_network_stabilization":
             "🟡 <b>Preparing to Wake</b>\n\nWaiting 15 seconds for network to stabilize before sending WOL...",
         "wol_packet_sent":
-            "📡 <b>WOL Sent</b>\n\nWake-on-LAN packet broadcast to M900 (00:23:24:c7:1f:5d). Boot takes ~30–60s.",
+            "📡 <b>WOL Sent</b>\n\nWake-on-LAN packet broadcast to M900. Boot takes ~30–60s.",
         "wan_restored_mains_down_hold":
             "🌐 <b>WAN Restored</b>\n\nInternet is back, but mains is still down. Holding restore until power returns.",
     }
     if event in mapping:
-            send_telegram(mapping[event])
+        send_telegram(mapping[event])
 
     # --- Outcome verification for shutdown/wake triggers ---
     if event in ("shutdown_mains_start", "shutdown_wan_start",
@@ -734,10 +768,16 @@ def build_status_message():
         ext_str = f"  (ext: {ext_uptime})" if ext_uptime != "Unavailable" else ""
         mains_line = f"{mains_icon} Mains: {'UP' + ext_str if mains_up else 'DOWN'}"
 
+        # Runtime-adjustable delay reported by the ESP32; fall back to the
+        # compiled-in default when absent (older firmware / no data).
+        mains_delay_ms = state.get("mainsDelayMs", MAINS_FAILURE_TIMEOUT_MS)
+        if not isinstance(mains_delay_ms, (int, float)) or mains_delay_ms < 60000:
+            mains_delay_ms = MAINS_FAILURE_TIMEOUT_MS
+
         # Countdown line — only when actively counting down
         countdown_line = ""
         if not mains_up and mains_fail_ms > 0 and not man_ovr and not (sd_mains or sd_wan or sd_manual):
-            remaining = MAINS_FAILURE_TIMEOUT_MS - mains_fail_ms
+            remaining = mains_delay_ms - mains_fail_ms
             m = int(remaining // 1000 // 60)
             s = int(remaining // 1000 % 60)
             countdown_line = f"\n⏳ Shutting down in {m}m {s}s..."
@@ -816,6 +856,7 @@ def build_diag_message():
         f"📈 Flaps (10m): {flaps}/3{stale}\n"
         f"🛡️ Manual override: {'ON' if man_ovr else 'OFF'}{stale}\n"
         f"🔌 ManualOff while mains down: {'YES' if man_mains else 'NO'}{stale}\n"
+        f"⏳ Mains delay: {int(state.get('mainsDelayMs', MAINS_FAILURE_TIMEOUT_MS)) // 60000} min\n"
         f"⏱️ Poll: {ESP32_POLL_INTERVAL}s"
     )
 
@@ -866,6 +907,51 @@ def handle_command(text):
             )
             return
         _send_esp32_command({"cmd": "shutdown"})
+
+    elif text.split()[0] in ("/custom-delay", "/custom_delay"):
+        parts = text.split()
+        state = _get_esp32_state()
+        cur_ms = state.get("mainsDelayMs") if state else None
+
+        if len(parts) == 1:
+            # No argument — show current setting and usage
+            cur = f"{int(cur_ms) // 60000} min" if isinstance(cur_ms, (int, float)) and cur_ms >= 60000 else "unknown (no data from ESP32)"
+            send_telegram(
+                "ℹ️ <b>Mains Shutdown Delay</b>\n\n"
+                f"Current: <b>{cur}</b> (default 5 min)\n"
+                "Usage: <code>/custom-delay &lt;minutes&gt;</code> (1–720)\n"
+                "Or: <code>/custom-delay reset</code>"            )
+            return
+
+        arg = parts[1].lower()
+        if arg == "reset":
+            minutes = 5
+        else:
+            try:
+                minutes = int(arg)
+            except ValueError:
+                send_telegram("⚠️ Usage: <code>/custom-delay &lt;minutes&gt;</code> (1–720) or <code>/custom-delay reset</code>")
+                return
+            if not (1 <= minutes <= 720):
+                send_telegram("⚠️ Delay must be between <b>1</b> and <b>720</b> minutes.")
+                return
+
+        if not _is_esp32_reachable():
+            send_telegram(
+                "❌ <b>ESP32 Unreachable</b>\n\n"
+                "Can't change the delay — no link to sensor."
+            )
+            return
+
+        if _send_esp32_command({"cmd": "custom_delay", "minutes": minutes}):
+            suffix = " (default)" if minutes == 5 else ""
+            send_telegram(
+                f"✅ <b>Mains Shutdown Delay Set</b>\n\n"
+                f"Auto-shutdown now fires after <b>{minutes} min{suffix}</b> of mains failure.\n"
+                f"Setting is persisted on the ESP32 and survives reboots. WAN timeout unchanged (10 min)."
+            )
+        else:
+            send_telegram("❌ Failed to deliver the delay command to the ESP32.")
 
 def telegram_poll_loop():
     global _tg_last_id
@@ -949,13 +1035,13 @@ Exposes a JSON telemetry api endpoint on `/state` via a lightweight local server
 #include <WebServer.h>
 
 // ===================== CONFIG =====================
-const char* WIFI_SSID    = "ASUS_70_2G";
-const char* WIFI_PASS    = "WIFI_PASSWORD";
+const char* WIFI_SSID    = "YOUR_WIFI_SSID";
+const char* WIFI_PASS    = "YOUR_WIFI_PASSWORD";
 // --- HARDWARE LOCK: Bound strictly to the Main Router's 2.4GHz BSSID ---
-const uint8_t MAIN_ROUTER_BSSID[] = {0xCC, 0x28, 0xAA, 0xC0, 0xA2, 0x70}; 
+const uint8_t MAIN_ROUTER_BSSID[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}; 
 
-const char* OTA_PASSWORD = "password";
-const char* FW_VERSION   = "V6.4";
+const char* OTA_PASSWORD = "YOUR_OTA_PASSWORD";
+const char* FW_VERSION   = "V6.6";
 
 const char* PING_TARGET  = "192.168.0.2"; // Extender IP for checking mains status
 const int   PING_PORT    = 80;
@@ -965,7 +1051,7 @@ const int   WAN_PORT     = 53;
 
 const char* SHUTDOWN_URL = "http://192.168.0.50:9999/shutdown";
 const char* BROADCAST_IP = "192.168.0.255";
-const char* M900_MAC     = "00:23:24:c7:1f:5d";
+const char* M900_MAC     = "AA:BB:CC:DD:EE:FF";
 
 // Target Pi notification endpoint
 const char* PI_NOTIFY_URL = "http://192.168.0.169:9997/notify";
@@ -1016,6 +1102,12 @@ bool flapWarned = false;
 
 // --- Command Deferral Flag ---
 String pendingCommand = "";
+long pendingCustomDelayMin = -1;
+
+// --- Runtime-adjustable timeouts ---
+// Mains failure timeout can be changed at runtime via the Pi (/custom-delay
+// -> POST /command). Defaults to MAINS_FAILURE_TIMEOUT_MS, persisted in NVS.
+unsigned long mainsFailureTimeoutMs = MAINS_FAILURE_TIMEOUT_MS;
 
 WiFiUDP udp;
 WebServer server(80);
@@ -1039,7 +1131,7 @@ void saveState() {
     prefs.putBool("sdManual",     shutdownReasonManual);
     prefs.putBool("sdManMains",   manualOffWhileMainsDown);
     prefs.putBool("manOvr",       manualOverride);
-    prefs.putULong("sdIssuedAt",  shutdownIssuedAt); 
+    prefs.putULong("mainsDelay",  mainsFailureTimeoutMs);
     prefs.end();
 }
 
@@ -1051,11 +1143,17 @@ void loadState() {
     shutdownReasonManual    = prefs.getBool("sdManual",   false);
     manualOffWhileMainsDown = prefs.getBool("sdManMains", false);
     manualOverride          = prefs.getBool("manOvr",     false);
+    unsigned long savedDelay = prefs.getULong("mainsDelay", 0);
+    if (savedDelay >= 60000UL && savedDelay <= 720UL * 60000UL) {
+        mainsFailureTimeoutMs = savedDelay;
+    }
     prefs.end();
 
     // if we're booting up already marked as "shut down" (e.g. ESP32
     // itself rebooted mid-window), restart the settle timer from now rather
     // than trusting a pre-reboot millis() value or defaulting to 0.
+    // (A persisted millis() stamp is meaningless across reboots, so the old
+    // "sdIssuedAt" NVS key was removed entirely.)
     if (shutdownReasonMains || shutdownReasonWAN || shutdownReasonManual) {
         shutdownIssuedAt = millis();
     }
@@ -1065,11 +1163,13 @@ void loadState() {
 // HELPERS
 // ==================================================
 
-void notifyPi(String eventType) {
+void notifyPi(String eventType, String extra = "") {
     if (WiFi.status() != WL_CONNECTED) return;
     WiFiClient client;
     HTTPClient http;
-    http.begin(client, String(PI_NOTIFY_URL) + "?event=" + eventType);
+    String url = String(PI_NOTIFY_URL) + "?event=" + eventType;
+    if (extra.length()) url += "&" + extra;
+    http.begin(client, url);
     http.setTimeout(2000);
     http.GET();
     http.end();
@@ -1077,8 +1177,11 @@ void notifyPi(String eventType) {
 
 bool tcpCheck(const char* host, int port, int timeoutMs = 2000) {
     WiFiClient client;
-    client.setTimeout(timeoutMs);
-    bool result = client.connect(host, port);
+    // Use the connect(host, port, timeout_ms) overload — setTimeout() only
+    // affects socket READS, not the TCP connect handshake, so the old code
+    // could block for the core's default connect timeout (several seconds)
+    // instead of the intended 800ms/2000ms budget.
+    bool result = client.connect(host, port, (int64_t)timeoutMs);
     client.stop();
     return result;
 }
@@ -1218,7 +1321,10 @@ void executeShutdownProxmox(String mode) {
         notifyPi("shutdown_wan_start");
     } else { // manual
         shutdownReasonManual = true;
-        if (!isMainsUp()) {
+        portENTER_CRITICAL(&cacheMux);
+        bool mainsUpNow = cachedMainsUp;
+        portEXIT_CRITICAL(&cacheMux);
+        if (!mainsUpNow) {
             manualOffWhileMainsDown = true;
             notifyPi("shutdown_manual_mains_down");
         } else {
@@ -1231,9 +1337,9 @@ void executeShutdownProxmox(String mode) {
     saveState();
 
     // Fire Proxmox Hook — tighter timeout, pump server immediately after
-    WiFiClient client;                // <--- Add this line
+    WiFiClient client;                // explicit client: avoids HTTPClient reuse crash
     HTTPClient http;
-    http.begin(client, SHUTDOWN_URL); // <--- Pass the client object here
+    http.begin(client, SHUTDOWN_URL);
     http.setTimeout(1000);
     http.GET();
     http.end();
@@ -1274,9 +1380,17 @@ void executeWakeProxmox(String reason) {
 // ==================================================
 
 void handleGetState() {
-    DynamicJsonDocument doc(512);
-    doc["mainsUp"] = cachedMainsUp;
-    doc["wanUp"]   = cachedWanUp;
+    JsonDocument doc;
+
+    // Read the cached sensor values under the same spinlock the writer
+    // tasks use (loop() does the same — keep this consistent).
+    portENTER_CRITICAL(&cacheMux);
+    bool mainsUpCached = cachedMainsUp;
+    bool wanUpCached   = cachedWanUp;
+    portEXIT_CRITICAL(&cacheMux);
+
+    doc["mainsUp"] = mainsUpCached;
+    doc["wanUp"]   = wanUpCached;
     doc["sdMains"] = shutdownReasonMains;
     doc["sdWAN"] = shutdownReasonWAN;
     doc["sdManual"] = shutdownReasonManual;
@@ -1297,6 +1411,7 @@ void handleGetState() {
     doc["rssi"] = WiFi.RSSI();
     doc["freeHeap"] = ESP.getFreeHeap();
     doc["fw"] = FW_VERSION;
+    doc["mainsDelayMs"] = mainsFailureTimeoutMs;
 
     String response;
     serializeJson(doc, response);
@@ -1309,7 +1424,7 @@ void handlePostCommand() {
         return;
     }
     
-    DynamicJsonDocument doc(256);
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, server.arg("plain"));
     if (error) {
         server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
@@ -1320,6 +1435,15 @@ void handlePostCommand() {
     if (cmd == "wake" || cmd == "shutdown") {
         pendingCommand = cmd; // Defers processing to main loop, avoiding stack re-entrancy crashes
         server.send(200, "application/json", "{\"status\":\"pending\"}");
+    } else if (cmd == "custom_delay") {
+        long mins = doc["minutes"] | -1L;
+        if (mins >= 1 && mins <= 720) {
+            pendingCustomDelayMin = mins;
+            pendingCommand = "custom_delay"; // Deferred like the others — NVS write stays out of server context
+            server.send(200, "application/json", "{\"status\":\"pending\"}");
+        } else {
+            server.send(400, "application/json", "{\"error\":\"minutes must be 1-720\"}");
+        }
     } else {
         server.send(400, "application/json", "{\"error\":\"Unknown command\"}");
     }
@@ -1416,13 +1540,30 @@ void loop() {
         String executeCmd = pendingCommand;
         pendingCommand = ""; // clear flag immediately
         if (executeCmd == "wake") {
-            if (!isMainsUp()) {
+            portENTER_CRITICAL(&cacheMux);
+            bool mainsUpNow = cachedMainsUp;
+            portEXIT_CRITICAL(&cacheMux);
+            if (!mainsUpNow) {
                 manualOverride = true;
                 saveState();
             }
             executeWakeProxmox("Manual request executed via Pi.");
+            // Only keep the recovery-suppression latch armed if a mains
+            // failure is actually still in progress; otherwise a stale
+            // wakeExecuted would swallow the next legitimate flap /
+            // mains_false_alarm event after a manual on->off->on cycle.
+            if (!mainsFailureStarted) {
+                wakeExecuted = false;
+            }
         } else if (executeCmd == "shutdown") {
             executeShutdownProxmox("manual");
+        } else if (executeCmd == "custom_delay") {
+            if (pendingCustomDelayMin > 0) {
+                mainsFailureTimeoutMs = (unsigned long)pendingCustomDelayMin * 60000UL;
+                saveState();
+                Serial.printf("Mains failure timeout set to %ld min\n", pendingCustomDelayMin);
+            }
+            pendingCustomDelayMin = -1;
         }
     }
 
@@ -1470,12 +1611,15 @@ void loop() {
             mainsDownNotified = true; // <--- Just use the global variable directly
             if (isM900ShutDown()) {
                 notifyPi("mains_down_shutdown_suppressed");
+            } else if (manualOverride) {
+                notifyPi("mains_down_override_active");
             } else {
-                notifyPi(manualOverride ? "mains_down_override_active" : "mains_down_countdown_start");
+                notifyPi("mains_down_countdown_start",
+                         "mins=" + String(mainsFailureTimeoutMs / 60000UL));
             }
         }
 
-        if (!manualOverride && !isM900ShutDown() && (now - mainsFirstFailTime >= MAINS_FAILURE_TIMEOUT_MS)) {
+        if (!manualOverride && !isM900ShutDown() && (now - mainsFirstFailTime >= mainsFailureTimeoutMs)) {
             executeShutdownProxmox("mains");
         }
     } else {
@@ -1660,8 +1804,7 @@ monitor_speed = 115200
 upload_protocol = espota
 upload_port = 192.168.0.178
 upload_flags =
-    --auth=password
+    --auth=YOUR_OTA_PASS
 lib_deps =
-    ayushsharma82/ElegantOTA
-    bblanchon/ArduinoJson
+    bblanchon/ArduinoJson@^7.0.0
 ```
