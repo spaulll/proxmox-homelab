@@ -389,6 +389,22 @@ def fmt_downtime(secs):
     h, m = divmod(mins, 60)
     return f"{h}h {m}m"
 
+def _bar(frac, width=10):
+    """Progress bar for countdowns — e.g. ▰▰▰▰▰▰▰▱▱▱"""
+    try:
+        frac = max(0.0, min(1.0, float(frac)))
+    except (TypeError, ValueError):
+        frac = 0.0
+    filled = round(frac * width)
+    return "▰" * filled + "▱" * (width - filled)
+
+def _rssi_bars(rssi):
+    """4-segment signal-strength indicator from dBm."""
+    if rssi >= -50:   return "▂▄▆█"
+    elif rssi >= -65: return "▂▄▆░"
+    elif rssi >= -80: return "▂▄░░"
+    else:             return "▂░░░"
+
 def _today_str():
     return time.strftime("%Y-%m-%d")
 
@@ -750,6 +766,11 @@ def build_status_message():
     prox_up, prox_uptime = get_proxmox_uptime()
     ext_uptime = get_extender_uptime()
 
+    header = (
+        f"⚡ <b>UPS STATUS</b>  <i>{time.strftime('%H:%M:%S')}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+
     if state:
         mains_up = state.get("mainsUp", False)
         wan_up   = state.get("wanUp",   False)
@@ -762,32 +783,40 @@ def build_status_message():
         mains_fail_ms = state.get("mainsFailSinceMs", 0)
         wan_fail_ms   = state.get("wanFailSinceMs",   0)
 
-        mains_icon = "🟢" if mains_up else "🔴"
-        wan_icon   = "🟢" if wan_up   else "🔴"
-
-        ext_str = f"  (ext: {ext_uptime})" if ext_uptime != "Unavailable" else ""
-        mains_line = f"{mains_icon} Mains: {'UP' + ext_str if mains_up else 'DOWN'}"
-
         # Runtime-adjustable delay reported by the ESP32; fall back to the
         # compiled-in default when absent (older firmware / no data).
         mains_delay_ms = state.get("mainsDelayMs", MAINS_FAILURE_TIMEOUT_MS)
         if not isinstance(mains_delay_ms, (int, float)) or mains_delay_ms < 60000:
             mains_delay_ms = MAINS_FAILURE_TIMEOUT_MS
 
-        # Countdown line — only when actively counting down
+        ext_str = f"  · ext <code>{ext_uptime}</code>" if ext_uptime != "Unavailable" else ""
+        mains_line = f"{'🟢' if mains_up else '🔴'} <b>Mains</b>  <code>{'UP' if mains_up else 'DOWN'}</code>{ext_str}"
+        wan_line   = f"{'🟢' if wan_up else '🔴'} <b>WAN</b>    <code>{'UP' if wan_up else 'DOWN'}</code>"
+        prox_line  = (
+            f"{'🟢' if prox_up else '🔴'} <b>Proxmox</b>  "
+            f"<code>{'ONLINE' if prox_up else 'OFFLINE'}</code>  · ⏱ <code>{prox_uptime}</code>"
+        )
+
+        # Countdown — only when actively counting down, with progress bar
         countdown_line = ""
         if not mains_up and mains_fail_ms > 0 and not man_ovr and not (sd_mains or sd_wan or sd_manual):
-            remaining = mains_delay_ms - mains_fail_ms
+            remaining = max(0, mains_delay_ms - mains_fail_ms)
             m = int(remaining // 1000 // 60)
             s = int(remaining // 1000 % 60)
-            countdown_line = f"\n⏳ Shutting down in {m}m {s}s..."
+            frac = remaining / mains_delay_ms
+            countdown_line = (
+                f"\n\n⏳ <b>Shutting down in {m}m {s}s</b>\n"
+                f"<code>{_bar(frac)}</code> <i>{int(round(frac * 100))}% left</i>"
+            )
         elif not wan_up and wan_fail_ms > 0 and not (sd_mains or sd_wan or sd_manual):
-            remaining = WAN_FAILURE_TIMEOUT_MS - wan_fail_ms
+            remaining = max(0, WAN_FAILURE_TIMEOUT_MS - wan_fail_ms)
             m = int(remaining // 1000 // 60)
             s = int(remaining // 1000 % 60)
-            countdown_line = f"\n⏳ WAN shutdown in {m}m {s}s..."
-
-        wan_line  = f"{wan_icon} WAN: {'UP' if wan_up else 'DOWN'}"
+            frac = remaining / WAN_FAILURE_TIMEOUT_MS
+            countdown_line = (
+                f"\n\n⏳ <b>WAN shutdown in {m}m {s}s</b>\n"
+                f"<code>{_bar(frac)}</code> <i>{int(round(frac * 100))}% left</i>"
+            )
 
         if sd_manual:             sd_reason = "Manual /off"
         elif sd_mains and sd_wan: sd_reason = "Mains &amp; WAN failure"
@@ -796,25 +825,28 @@ def build_status_message():
         else:                     sd_reason = None
 
     else:
-        mains_line = "⚪ Mains: UNKNOWN"
-        wan_line   = "⚪ WAN: UNKNOWN"
+        mains_line = "⚪ <b>Mains</b>  <code>UNKNOWN</code>"
+        wan_line   = "⚪ <b>WAN</b>    <code>UNKNOWN</code>"
+        prox_line  = f"{'🟢' if prox_up else '🔴'} <b>Proxmox</b>  <code>{'ONLINE' if prox_up else 'OFFLINE'}</code>  · ⏱ <code>{prox_uptime}</code>"
         countdown_line = ""
         sd_reason = None
 
-    stale_note = "\n⚠️ ESP32 offline — cached data" if not sensor_alive else ""
-    prox_line  = f"{'🟢' if prox_up else '🔴'} Proxmox: {'ONLINE' if prox_up else 'OFFLINE'}  ⌚ {prox_uptime}"
-    footer     = f"⚙️ {sd_reason}" if sd_reason else "⚙️ No active shutdown reason"
+    stale_note = "\n⚠️ <i>ESP32 offline — showing cached data</i>" if not sensor_alive else ""
+    footer     = f"🛡 <b>{sd_reason}</b>" if sd_reason else "🛡 <i>No active shutdown reason</i>"
 
     counters = _get_counters()
-    stats_line = f"📊 Today: {counters['mains_down']} mains down · {counters['shutdowns']} shutdown{'s' if counters['shutdowns'] != 1 else ''}"
+    stats_line = (
+        f"📊 Today · <b>{counters['mains_down']}</b> mains down · "
+        f"<b>{counters['shutdowns']}</b> shutdown{'s' if counters['shutdowns'] != 1 else ''}"
+    )
 
     return (
-        f"📊 UPS STATUS\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"{mains_line}{countdown_line}\n"
+        f"{header}\n"
+        f"{mains_line}\n"
         f"{wan_line}\n"
-        f"{prox_line}\n"
-        f"━━━━━━━━━━━━━━\n"
+        f"{prox_line}"
+        f"{countdown_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{footer}\n"
         f"{stats_line}"
         f"{stale_note}"
@@ -829,7 +861,7 @@ def build_diag_message():
     sensor_alive = _is_esp32_reachable()
 
     if not state:
-        return "🔧 ESP32 DIAGNOSTICS\n━━━━━━━━━━━━━━\n⚪ ESP32 unreachable — no data available."
+        return "🔧 <b>ESP32 DIAGNOSTICS</b>\n\n⚪ <i>Unreachable — no data available.</i>"
 
     fw        = state.get("fw", "?")
     esp_ms    = state.get("espUptimeMs", 0)
@@ -839,25 +871,34 @@ def build_diag_message():
     man_mains = state.get("manualOffMainsDown", False)
     man_ovr   = state.get("manualOverride", False)
 
-    if rssi >= -50:   rssi_q = "Excellent"
-    elif rssi >= -65: rssi_q = "Good"
-    elif rssi >= -80: rssi_q = "Weak"
-    else:             rssi_q = "Critical"
+    if rssi >= -50:   rssi_q, bars = "EXCELLENT", _rssi_bars(rssi)
+    elif rssi >= -65: rssi_q, bars = "Good",     _rssi_bars(rssi)
+    elif rssi >= -80: rssi_q, bars = "Weak",     _rssi_bars(rssi)
+    else:             rssi_q, bars = "Critical", _rssi_bars(rssi)
 
-    stale = " ⚠️ (STALE)" if not sensor_alive else ""
+    badge = "🔴 STALE" if not sensor_alive else "🟢 LIVE"
+
+    panel = (
+        f"┌─ ESP32 NODE ───────────────\n"
+        f"│ ip       {ESP32_IP}\n"
+        f"│ firmware {fw}\n"
+        f"│ uptime   {fmt_uptime(esp_ms // 1000)}\n"
+        f"│ signal   {rssi} dBm {bars} {rssi_q}\n"
+        f"│ heap     {free_heap // 1024} KB free\n"
+        f"│ flaps    {flaps}/3 · last 10 min\n"
+        f"├─ CONFIG ───────────────────\n"
+        f"│ mains delay  {int(state.get('mainsDelayMs', MAINS_FAILURE_TIMEOUT_MS)) // 60000} min\n"
+        f"│ wan timeout  {WAN_FAILURE_TIMEOUT_MS // 60000} min\n"
+        f"│ poll         every {ESP32_POLL_INTERVAL}s\n"
+        f"├─ FLAGS ────────────────────\n"
+        f"│ override     {'ON ' if man_ovr else 'OFF'}\n"
+        f"│ off-while-down {'YES' if man_mains else 'NO'}\n"
+        f"└────────────────────────────"
+    )
 
     return (
-        f"🔧 ESP32 DIAGNOSTICS\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"📡 ESP32: {ESP32_IP}  ⌚ {fmt_uptime(esp_ms // 1000)}{stale}\n"
-        f"📶 RSSI: {rssi} dBm ({rssi_q}){stale}\n"
-        f"🧠 Heap: {free_heap // 1024} KB{stale}\n"
-        f"🏷️ Firmware: {fw}\n"
-        f"📈 Flaps (10m): {flaps}/3{stale}\n"
-        f"🛡️ Manual override: {'ON' if man_ovr else 'OFF'}{stale}\n"
-        f"🔌 ManualOff while mains down: {'YES' if man_mains else 'NO'}{stale}\n"
-        f"⏳ Mains delay: {int(state.get('mainsDelayMs', MAINS_FAILURE_TIMEOUT_MS)) // 60000} min\n"
-        f"⏱️ Poll: {ESP32_POLL_INTERVAL}s"
+        f"🔧 <b>ESP32 DIAGNOSTICS</b>  <i>{badge}</i>\n\n"
+        f"<code>{panel}</code>"
     )
 
 # ==================================================
