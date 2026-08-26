@@ -7,7 +7,7 @@ This document outlines the complete setup for the decentralized V5 ESP32-based U
 1. **The Shutdown Webhook** (Running on the Proxmox host to execute local node cut commands).
 2. **The Extender Uptime Bridge** (Running on the Pi to grab hardware logs from the ASUS/DIR router).
 3. **The ESP32 Firmware** (The autonomous, lightweight hardware sensor and absolute fallback executioner).
-4. **The Raspberry Pi Main Brain Service** (The control plane managing Telegram long-polling, SOCKS5 proxies, formatting, and live state compilation).
+4. **The Raspberry Pi Main Brain Service** (The control plane managing dual-channel alerting — Telegram primary with ntfy fallback — plus long-polling, SOCKS5 proxies, formatting, and live state compilation).
 5. **The ESP32 Builder LXC** (CI/CD automated compilation and OTA delivery container).
 
 ---
@@ -35,7 +35,20 @@ This document outlines the complete setup for the decentralized V5 ESP32-based U
 - Handles Telegram long-polling + commands: `/status` (mains/WAN/Proxmox + live countdown), `/diag` (RSSI, heap, firmware, flaps, overrides, delay), `/on`, `/off` (both gated on ESP32 reachability + current Proxmox state), `/custom_delay` (set/reset/show the mains auto-shutdown delay, 1–720 min; `/custom-delay` hyphen alias also accepted)
 - Queries Proxmox API (`:8006`) and extender-uptime bridge (`:9998`) directly and independently of ESP32
 - Verifies shutdown/wake outcomes by polling Proxmox for up to 120s post-trigger, sends confirmation or timeout warning
+- **v6.5 — Dual-channel alerting:** every outbound alert passes through a single `notify()` gate — Telegram first; if Telegram fails (typical when WAN is down), the message falls back to **ntfy**
+- ntfy fallback tries the reverse-proxy domain first, then the raw LXC IP (DNS/proxy paths can degrade differently during WAN failover); the title is prefixed `[TG FAILED]`
+- Priority auto-maps from emoji severity (🚨 → urgent, ⚠️/🔴 → high, else default); Telegram HTML markup is stripped for plain-text delivery
+- Bodies over 4 KB are truncated before publish so neither Telegram's nor ntfy's 4096-byte caps can silently drop an alert
 - Optional SOCKS5 proxy for Telegram traffic (`TG_PROXY`, currently `None`)
+
+### Notification Channels (v6.5)
+
+| | Channel | Endpoint(s) | Notes |
+|---|---|---|---|
+| Primary | Telegram Bot API | `api.telegram.org` | HTML parse mode, long-poll commands |
+| Fallback | ntfy topic `ups` | `https://ntfy.<domain>` (via Nginx Proxy Manager, valid LE cert) → `http://<ntfy-lxc-ip>` (direct) | Tried in order until one accepts; `[TG FAILED]` prefix flags degraded mode |
+
+Fallback triggers on any Telegram failure: network unreachable (WAN down), HTTP errors, malformed payload rejection. Delivery success requires an explicit `200`/`ok` from at least one channel.
 
 ---
 
@@ -223,12 +236,14 @@ Runs the central Telegram bot engine, long-polls updates, interacts with local S
 #!/usr/bin/env python3
 """
 UPS Monitor Brain — Pi (192.168.0.169)
-Version: 6.4 (Custom mains-failure delay via /custom-delay)
+Version: 6.5 (ntfy fallback when Telegram unreachable)
 """
 
+import html as html_lib
 import json
 import logging
 import os
+import re
 import socket
 import ssl
 import http.client
@@ -259,6 +274,16 @@ TG_BOT_TOKEN        = "TG_BOT_TOKEN"
 TG_CHAT_ID          = "TG_CHAT_ID"
 TG_POLL_TIMEOUT     = 5         # Telegram long-poll seconds
 TG_RETRY_DELAY      = 5         # wait after Telegram error
+
+# ntfy fallback — used when Telegram delivery fails (e.g. WAN down).
+# Domain first (via NPM reverse proxy), then raw LXC IP in case the
+# domain/DNS path breaks during a WAN failover.
+NTFY_URLS           = [
+    "https://ntfy.YOUR_DOMAIN.duckdns.org",
+    "http://10.10.10.241",
+]
+NTFY_TOPIC          = "ups"
+NTFY_TIMEOUT        = 6
 
 # Plug-and-play SOCKS5 proxy
 TG_PROXY            = None  
@@ -363,6 +388,71 @@ def send_telegram(text):
         log.error(f"FATAL: Telegram dropped payload (WAN down?): {result}")
         return False
     return True
+
+# ==================================================
+# NTFY FALLBACK CHANNEL (used when Telegram fails)
+# ==================================================
+
+def _strip_html(text):
+    """Converts Telegram HTML markup to plain text for ntfy."""
+    text = re.sub(r"</?(b|i|u|s|code|pre|a)[^>]*>", "", text)
+    return html_lib.unescape(text)
+
+def send_ntfy(text, tg_failed=False):
+    """
+    Publishes to every ntfy endpoint until one accepts. Returns True if
+    any delivery succeeded. Tries the reverse-proxy domain first, then
+    the raw container IP — during a WAN outage DNS/proxy paths can
+    degrade differently, so both are attempted.
+    """
+    body     = _strip_html(text)
+    # ntfy rejects bodies over ~4KB just like Telegram — truncate so the
+    # fallback channel can still deliver an oversized alert.
+    if len(body) > 4000:
+        body = body[:4000] + "\n… [truncated]"
+    lines    = [l.strip() for l in body.splitlines() if l.strip()]
+    title    = lines[0] if lines else "UPS Notification"
+    payload  = ("\n".join(lines[1:]) or title).encode()
+
+    if "🚨" in body:
+        priority, tag = "urgent", "rotating_light"
+    elif ("⚠️" in body) or ("🔴" in body):
+        priority, tag = "high", "warning"
+    else:
+        priority, tag = "default", "information_source"
+
+    # HTTP headers are latin-1 only — drop emoji/unicode from the title.
+    safe_title = re.sub(r"[^\x20-\x7e]", "", title).strip() or "UPS Notification"
+    if tg_failed:
+        safe_title = "[TG FAILED] " + safe_title
+    headers = {"Title": safe_title[:200], "Priority": priority, "Tags": tag}
+
+    delivered_via = None
+    for base in NTFY_URLS:
+        try:
+            req = urllib.request.Request(f"{base}/{NTFY_TOPIC}", data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=NTFY_TIMEOUT) as r:
+                if r.status == 200:
+                    delivered_via = base
+                    break
+        except Exception as e:
+            log.warning(f"ntfy delivery via {base} failed: {e}")
+    if delivered_via:
+        log.info(f"ntfy notification delivered via {delivered_via}")
+        return True
+    log.error("ntfy delivery failed on all endpoints")
+    return False
+
+def notify(text):
+    """
+    Single entry point for all outbound alerts.
+    Primary: Telegram. Fallback: ntfy (message is flagged when TG dropped).
+    Returns True only if at least one channel confirmed delivery.
+    """
+    if send_telegram(text):
+        return True
+    log.warning("Telegram unreachable — falling back to ntfy")
+    return send_ntfy(text, tg_failed=True)
 
 # ==================================================
 # CORE LOGIC AGGREGATORS
@@ -520,13 +610,13 @@ def _verify_proxmox_transition(expect_up, trigger_label, timeout_sec=120, interv
                         adjusted = max(0, elapsed - EXTENDER_BOOT_LAG_SEC)
                         downtime_line = f"\n⏱️ Approx mains downtime: ~{fmt_downtime(adjusted)}"
                         _mains_down_started_at = None
-                send_telegram(
+                notify(
                     f"✅ <b>Proxmox Confirmed Online</b>\n\n"
                     f"Trigger: {trigger_label}\n⌚ Uptime: {prox_uptime}"
                     f"{downtime_line}"
                 )
             else:
-                send_telegram(
+                notify(
                     f"✅ <b>Proxmox Confirmed Offline</b>\n\n"
                     f"Trigger: {trigger_label}"
                 )
@@ -535,7 +625,7 @@ def _verify_proxmox_transition(expect_up, trigger_label, timeout_sec=120, interv
 
     # Timed out without reaching expected state
     state_word = "online" if expect_up else "offline"
-    send_telegram(
+    notify(
         f"⚠️ <b>Verification Timeout</b>\n\n"
         f"Trigger: {trigger_label}\n"
         f"Proxmox did not confirm {state_word} within {timeout_sec}s. Check manually."
@@ -586,7 +676,7 @@ def _check_bios_reconciliation(state):
     if now - _prox_online_since >= RECONCILE_MIN_ONLINE_SEC:
         log.warning("Reconciling stale shutdown flags — Proxmox online without WOL trigger.")
         _send_esp32_command({"cmd": "wake"})
-        send_telegram(
+        notify(
             "⚠️ <b>Flags Reconciled</b>\n\n"
             "Proxmox has been online for 2.5+ min but the ESP32 still had a "
             "shutdown flag set (likely BIOS auto-power-on after mains restored, "
@@ -616,9 +706,9 @@ def esp32_poll_loop():
                     alert_dead = True
         
         if alert_recovery:
-            send_telegram(f"✅ <b>ESP32 BACK ONLINE</b>\n\nUPS sensor ({ESP32_IP}) recovered.\nFirmware: {recovery_fw}")
+            notify(f"✅ <b>ESP32 BACK ONLINE</b>\n\nUPS sensor ({ESP32_IP}) recovered.\nFirmware: {recovery_fw}")
         elif alert_dead:
-            success = send_telegram(f"⚠️ <b>ESP32 UNREACHABLE</b>\n\nSensor missed metrics. Authority systems remain autonomous.")
+            success = notify(f"⚠️ <b>ESP32 UNREACHABLE</b>\n\nSensor missed metrics. Authority systems remain autonomous.")
             with _lock:
                 if success:
                     _esp32_alerted = True # Only lock out future alerts if we actually told the user
@@ -741,7 +831,7 @@ def process_esp_notification(event, mins_raw=None):
             "🌐 <b>WAN Restored</b>\n\nInternet is back, but mains is still down. Holding restore until power returns.",
     }
     if event in mapping:
-        send_telegram(mapping[event])
+        notify(mapping[event])
 
     # --- Outcome verification for shutdown/wake triggers ---
     if event in ("shutdown_mains_start", "shutdown_wan_start",
@@ -910,14 +1000,14 @@ def handle_command(text):
     log.info(f"Processing chat instruction string tokens: {text!r}")
 
     if text == "/status":
-        send_telegram(build_status_message())
+        notify(build_status_message())
 
     elif text == "/diag":
-        send_telegram(build_diag_message())
+        notify(build_diag_message())
 
     elif text == "/on":
         if not _is_esp32_reachable():
-            send_telegram(
+            notify(
                 "❌ <b>ESP32 Unreachable</b>\n\n"
                 "Can't send wake command — no link to sensor.\n"
                 "Check 192.168.0.178 manually."
@@ -925,7 +1015,7 @@ def handle_command(text):
             return
         prox_up, _ = get_proxmox_uptime()
         if prox_up:
-            send_telegram(
+            notify(
                 "ℹ️ <b>Already Online</b>\n\n"
                 "Proxmox is already running. No action taken."
             )
@@ -934,7 +1024,7 @@ def handle_command(text):
 
     elif text == "/off":
         if not _is_esp32_reachable():
-            send_telegram(
+            notify(
                 "❌ <b>ESP32 Unreachable</b>\n\n"
                 "Can't send shutdown command — no link to sensor.\n"
                 "Shut down Proxmox manually via console."
@@ -942,7 +1032,7 @@ def handle_command(text):
             return
         prox_up, _ = get_proxmox_uptime()
         if not prox_up:
-            send_telegram(
+            notify(
                 "ℹ️ <b>Already Offline</b>\n\n"
                 "Proxmox is already down. No action taken."
             )
@@ -957,7 +1047,7 @@ def handle_command(text):
         if len(parts) == 1:
             # No argument — show current setting and usage
             cur = f"{int(cur_ms) // 60000} min" if isinstance(cur_ms, (int, float)) and cur_ms >= 60000 else "unknown (no data from ESP32)"
-            send_telegram(
+            notify(
                 "ℹ️ <b>Mains Shutdown Delay</b>\n\n"
                 f"Current: <b>{cur}</b> (default 5 min)\n"
                 "Usage: <code>/custom-delay &lt;minutes&gt;</code> (1–720)\n"
@@ -971,14 +1061,14 @@ def handle_command(text):
             try:
                 minutes = int(arg)
             except ValueError:
-                send_telegram("⚠️ Usage: <code>/custom-delay &lt;minutes&gt;</code> (1–720) or <code>/custom-delay reset</code>")
+                notify("⚠️ Usage: <code>/custom-delay &lt;minutes&gt;</code> (1–720) or <code>/custom-delay reset</code>")
                 return
             if not (1 <= minutes <= 720):
-                send_telegram("⚠️ Delay must be between <b>1</b> and <b>720</b> minutes.")
+                notify("⚠️ Delay must be between <b>1</b> and <b>720</b> minutes.")
                 return
 
         if not _is_esp32_reachable():
-            send_telegram(
+            notify(
                 "❌ <b>ESP32 Unreachable</b>\n\n"
                 "Can't change the delay — no link to sensor."
             )
@@ -986,13 +1076,13 @@ def handle_command(text):
 
         if _send_esp32_command({"cmd": "custom_delay", "minutes": minutes}):
             suffix = " (default)" if minutes == 5 else ""
-            send_telegram(
+            notify(
                 f"✅ <b>Mains Shutdown Delay Set</b>\n\n"
                 f"Auto-shutdown now fires after <b>{minutes} min{suffix}</b> of mains failure.\n"
                 f"Setting is persisted on the ESP32 and survives reboots. WAN timeout unchanged (10 min)."
             )
         else:
-            send_telegram("❌ Failed to deliver the delay command to the ESP32.")
+            notify("❌ Failed to deliver the delay command to the ESP32.")
 
 def telegram_poll_loop():
     global _tg_last_id
